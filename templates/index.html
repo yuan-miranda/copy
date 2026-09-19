@@ -1,0 +1,412 @@
+<!doctype html>
+<html>
+
+<head>
+    <title>ELMS</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+
+        html,
+        body {
+            margin: 0;
+            padding: 0;
+            height: 100%;
+            background: #fff;
+        }
+
+        #paste {
+            position: fixed;
+            inset: 0;
+            width: 100%;
+            height: 100%;
+            overflow-y: auto;
+            border: none;
+            outline: none;
+            background: #fff;
+            color: #000;
+            font: 14px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            padding: 10px;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+
+        #paste:empty::before {
+            content: attr(data-placeholder);
+            color: #999;
+            pointer-events: none;
+        }
+
+        #paste img {
+            max-width: 100%;
+            height: auto;
+            display: block;
+            margin: 6px 0;
+            border: 1px solid #000;
+        }
+
+        #paste img.img-selected {
+            outline: 2px solid #0078d4;
+            outline-offset: 1px;
+        }
+
+        .resize-handle {
+            position: fixed;
+            width: 12px;
+            height: 12px;
+            background: #0078d4;
+            border: 1px solid #fff;
+            box-sizing: border-box;
+            cursor: se-resize;
+            z-index: 2;
+            touch-action: none;
+        }
+
+        .bar {
+            position: fixed;
+            right: 3px;
+            bottom: 3px;
+            display: flex;
+            gap: 6px;
+            z-index: 1;
+        }
+
+        button {
+            padding: 2px 4px;
+            border: 1px solid #000;
+            background: #fff;
+            color: #000;
+            font: inherit;
+            font-size: 12px;
+            cursor: pointer;
+        }
+
+        #status {
+            position: fixed;
+            left: 3px;
+            bottom: 3px;
+            font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            color: #666;
+            z-index: 1;
+        }
+
+        #paste.drag-over {
+            background: #f0f0f0;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="paste" contenteditable="true" spellcheck="false"
+        data-placeholder="Paste or type here... (images can be pasted or dropped too)"></div>
+    <div id="status"></div>
+    <div class="bar">
+        <button onclick="copyText()">Copy</button>
+    </div>
+    <script>
+        const area = document.getElementById("paste");
+        const status = document.getElementById("status");
+        let socket = null;
+        let saveTimer = null;
+        let savedFadeTimer = null;
+        let reconnectTimer = null;
+        let pageCaching = false;
+
+        function setStatus(text) {
+            clearTimeout(savedFadeTimer);
+            status.textContent = text;
+        }
+
+        function sanitizeHtml(html) {
+            const template = document.createElement("template");
+            template.innerHTML = html;
+            sanitizeChildren(template.content);
+            return template.innerHTML;
+        }
+
+        function sanitizeChildren(node) {
+            for (const child of Array.from(node.childNodes)) {
+                if (child.nodeType === Node.TEXT_NODE) continue;
+                if (child.nodeType !== Node.ELEMENT_NODE) { child.remove(); continue; }
+
+                const tag = child.tagName.toLowerCase();
+                if (tag === "img") {
+                    const src = child.getAttribute("src") || "";
+                    if (!/^\/pastebin-image\//.test(src)) { child.remove(); continue; }
+                    const style = child.getAttribute("style") || "";
+                    const widthMatch = /^\s*width:\s*(\d+(?:\.\d+)?)px;?\s*$/i.exec(style);
+                    for (const attr of Array.from(child.attributes)) {
+                        if (attr.name !== "src" && attr.name !== "alt") child.removeAttribute(attr.name);
+                    }
+                    if (widthMatch) {
+                        const width = Math.max(20, Math.min(4000, parseFloat(widthMatch[1])));
+                        child.setAttribute("style", `width:${width}px;`);
+                    }
+                    continue;
+                }
+                if (tag === "br" || tag === "div") {
+                    for (const attr of Array.from(child.attributes)) child.removeAttribute(attr.name);
+                    sanitizeChildren(child);
+                    continue;
+                }
+                const text = document.createTextNode(child.textContent);
+                child.replaceWith(text);
+            }
+        }
+
+        function connect() {
+            setStatus("Connecting...");
+            socket = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/pastebin-ws");
+            socket.onopen = () => setStatus("");
+            socket.onmessage = event => {
+                const data = JSON.parse(event.data);
+                if (data.type === "update" && document.activeElement !== area) {
+                    deselectImage();
+                    area.innerHTML = sanitizeHtml(data.text || "");
+                }
+                if (data.type === "saved") {
+                    setStatus("Saved");
+                    savedFadeTimer = setTimeout(() => { status.textContent = ""; }, 1200);
+                }
+            };
+            socket.onclose = () => {
+                if (pageCaching) return;
+                setStatus("Offline, reconnecting...");
+                clearTimeout(reconnectTimer);
+                reconnectTimer = setTimeout(connect, 2000);
+            };
+            socket.onerror = () => socket.close();
+        }
+        connect();
+
+        window.addEventListener("pagehide", event => {
+            if (!event.persisted) return;
+            pageCaching = true;
+            clearTimeout(reconnectTimer);
+            if (socket) socket.close();
+        });
+
+        window.addEventListener("pageshow", event => {
+            if (!event.persisted) return;
+            pageCaching = false;
+            connect();
+        });
+
+        area.addEventListener("input", () => {
+            setStatus("Syncing...");
+            clearTimeout(saveTimer);
+            saveTimer = setTimeout(sendHtml, 300);
+        });
+
+        function sendHtml() {
+            if (socket && socket.readyState === WebSocket.OPEN) {
+                setStatus("Saving...");
+                socket.send(JSON.stringify({ type: "update", text: sanitizeHtml(area.innerHTML) }));
+            }
+        }
+
+        function copyText() {
+            navigator.clipboard.writeText(area.textContent);
+        }
+
+        function getEditableRange() {
+            const selection = window.getSelection();
+            if (selection && selection.rangeCount > 0) {
+                const range = selection.getRangeAt(0);
+                if (area.contains(range.commonAncestorContainer)) return range;
+            }
+            const range = document.createRange();
+            range.selectNodeContents(area);
+            range.collapse(false);
+            return range;
+        }
+
+        function insertNodeAtRange(node, range) {
+            range.deleteContents();
+            range.insertNode(node);
+            range.setStartAfter(node);
+            range.collapse(true);
+            const selection = window.getSelection();
+            selection.removeAllRanges();
+            selection.addRange(range);
+        }
+
+        function insertTextAtRange(text, range) {
+            insertNodeAtRange(document.createTextNode(text), range);
+        }
+
+        function insertImageAtRange(url, range) {
+            const img = document.createElement("img");
+            img.src = url;
+            img.alt = "pasted image";
+            insertNodeAtRange(img, range);
+            area.dispatchEvent(new Event("input"));
+        }
+
+        let selectedImg = null;
+        let resizeHandle = null;
+        let resizeState = null;
+
+        function positionHandle() {
+            if (!selectedImg || !resizeHandle) return;
+            const rect = selectedImg.getBoundingClientRect();
+            resizeHandle.style.left = `${rect.right - 6}px`;
+            resizeHandle.style.top = `${rect.bottom - 6}px`;
+        }
+
+        function selectImage(img) {
+            if (selectedImg === img) return;
+            deselectImage();
+            selectedImg = img;
+            selectedImg.classList.add("img-selected");
+            resizeHandle = document.createElement("div");
+            resizeHandle.className = "resize-handle";
+            document.body.appendChild(resizeHandle);
+            positionHandle();
+            resizeHandle.addEventListener("pointerdown", startResize);
+        }
+
+        function deselectImage() {
+            if (selectedImg) selectedImg.classList.remove("img-selected");
+            if (resizeHandle) resizeHandle.remove();
+            selectedImg = null;
+            resizeHandle = null;
+        }
+
+        function startResize(event) {
+            if (!selectedImg) return;
+            event.preventDefault();
+            event.stopPropagation();
+            resizeState = {
+                startX: event.clientX,
+                startWidth: selectedImg.getBoundingClientRect().width,
+            };
+            resizeHandle.setPointerCapture(event.pointerId);
+            resizeHandle.addEventListener("pointermove", onResizeMove);
+            resizeHandle.addEventListener("pointerup", endResize);
+        }
+
+        function onResizeMove(event) {
+            if (!resizeState || !selectedImg) return;
+            const width = Math.max(20, resizeState.startWidth + (event.clientX - resizeState.startX));
+            selectedImg.style.width = `${Math.round(width)}px`;
+            positionHandle();
+        }
+
+        function endResize(event) {
+            resizeHandle.releasePointerCapture(event.pointerId);
+            resizeHandle.removeEventListener("pointermove", onResizeMove);
+            resizeHandle.removeEventListener("pointerup", endResize);
+            resizeState = null;
+            area.dispatchEvent(new Event("input"));
+        }
+
+        area.addEventListener("click", event => {
+            if (event.target.tagName === "IMG" && area.contains(event.target)) {
+                selectImage(event.target);
+            } else {
+                deselectImage();
+            }
+        });
+
+        document.addEventListener("click", event => {
+            if (event.target === resizeHandle) return;
+            if (!area.contains(event.target)) deselectImage();
+        });
+
+        area.addEventListener("scroll", positionHandle);
+        window.addEventListener("resize", positionHandle);
+        window.addEventListener("scroll", positionHandle, true);
+
+        const IMAGE_EXTENSION_RE = /\.(png|jpe?g|gif|webp|bmp|avif|svg|heic|heif)$/i;
+
+        function isImageFile(file) {
+            if (!file) return false;
+            if (file.type && file.type.startsWith("image/")) return true;
+            return IMAGE_EXTENSION_RE.test(file.name || "");
+        }
+
+        async function uploadImage(file, range) {
+            setStatus("Uploading image...");
+            const formData = new FormData();
+            formData.append("image", file, file.name || "pasted-image.png");
+            try {
+                const response = await fetch("/pastebin-image", { method: "POST", body: formData });
+                if (!response.ok) throw new Error("Upload failed");
+                const data = await response.json();
+                insertImageAtRange(data.url, range);
+                setStatus("");
+            } catch (error) {
+                setStatus("Image upload failed");
+                savedFadeTimer = setTimeout(() => { status.textContent = ""; }, 2000);
+            }
+        }
+
+        area.addEventListener("paste", event => {
+            const items = event.clipboardData ? event.clipboardData.items : [];
+            for (const item of items) {
+                if (item.kind === "file") {
+                    const file = item.getAsFile();
+                    if (isImageFile(file)) {
+                        event.preventDefault();
+                        uploadImage(file, getEditableRange());
+                        return;
+                    }
+                }
+            }
+            const text = event.clipboardData ? event.clipboardData.getData("text/plain") : "";
+            if (text) {
+                event.preventDefault();
+                insertTextAtRange(text, getEditableRange());
+                area.dispatchEvent(new Event("input"));
+            }
+        });
+
+        area.addEventListener("dragenter", event => {
+            if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+            event.preventDefault();
+            area.classList.add("drag-over");
+        });
+
+        area.addEventListener("dragover", event => {
+            if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+            event.preventDefault();
+            area.classList.add("drag-over");
+        });
+
+        area.addEventListener("dragleave", () => {
+            area.classList.remove("drag-over");
+        });
+
+        function rangeFromPoint(x, y) {
+            if (document.caretRangeFromPoint) return document.caretRangeFromPoint(x, y);
+            if (document.caretPositionFromPoint) {
+                const pos = document.caretPositionFromPoint(x, y);
+                if (!pos) return null;
+                const range = document.createRange();
+                range.setStart(pos.offsetNode, pos.offset);
+                range.collapse(true);
+                return range;
+            }
+            return null;
+        }
+
+        area.addEventListener("drop", event => {
+            event.preventDefault();
+            area.classList.remove("drag-over");
+            const files = event.dataTransfer ? Array.from(event.dataTransfer.files) : [];
+            const images = files.filter(isImageFile);
+            if (images.length) {
+                const dropRange = rangeFromPoint(event.clientX, event.clientY) || getEditableRange();
+                images.forEach(file => uploadImage(file, dropRange.cloneRange()));
+            } else if (files.length) {
+                setStatus("Dropped file isn't a recognized image");
+                savedFadeTimer = setTimeout(() => { status.textContent = ""; }, 2000);
+            }
+        });
+    </script>
+</body>
+
+</html>
