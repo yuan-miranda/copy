@@ -172,13 +172,33 @@
 
         function snapImageToLines(img) {
             const lh = getLineHeight();
-            const currentHeight = img.getBoundingClientRect().height || img.offsetHeight;
-            if (currentHeight > 0) {
-                const targetLines = Math.max(1, Math.round(currentHeight / lh));
-                const snappedHeight = targetLines * lh;
-                img.style.height = `${snappedHeight}px`;
-                img.style.objectFit = "contain";
+
+            // Base the snap on the existing explicit height when present so repeated
+            // calls (on every keystroke via updateGutters) are idempotent and don't
+            // drift. Otherwise fall back to natural/rendered size.
+            const existingHeight = parseFloat(img.style.height);
+            const naturalRatio = img.naturalWidth && img.naturalHeight
+                ? img.naturalWidth / img.naturalHeight
+                : null;
+
+            const baseHeight = existingHeight > 0
+                ? existingHeight
+                : (img.getBoundingClientRect().height || img.naturalHeight || img.offsetHeight);
+
+            if (!(baseHeight > 0)) return;
+
+            const targetLines = Math.max(1, Math.round(baseHeight / lh));
+            const snappedHeight = targetLines * lh;
+
+            img.style.height = `${snappedHeight}px`;
+
+            // Always pair height with an explicit width, otherwise object-fit has
+            // nothing to contain against and the size drifts or is dropped by the
+            // sanitizer on the next sync round-trip.
+            if (naturalRatio) {
+                img.style.width = `${Math.round(snappedHeight * naturalRatio)}px`;
             }
+            img.style.objectFit = "contain";
         }
 
         function updateGutters() {
@@ -229,8 +249,11 @@
                     const src = child.getAttribute("src") || "";
                     if (!/^\/pastebin-image\//.test(src)) { child.remove(); continue; }
                     const style = child.getAttribute("style") || "";
-                    const widthMatch = /^\s*width:\s*(\d+(?:\.\d+)?)px;?\s*$/i.exec(style);
-                    const heightMatch = /^\s*height:\s*(\d+(?:\.\d+)?)px;?\s*$/i.exec(style);
+                    // Parse each declaration separately instead of anchoring the whole
+                    // string, since the style attribute holds width, height AND
+                    // object-fit together (e.g. "height:60px; width:80px; object-fit: contain;").
+                    const widthMatch = /(?:^|;)\s*width:\s*(\d+(?:\.\d+)?)px\s*(?:;|$)/i.exec(style);
+                    const heightMatch = /(?:^|;)\s*height:\s*(\d+(?:\.\d+)?)px\s*(?:;|$)/i.exec(style);
 
                     for (const attr of Array.from(child.attributes)) {
                         if (attr.name !== "src" && attr.name !== "alt") child.removeAttribute(attr.name);
@@ -239,6 +262,7 @@
                     let styleAttr = "";
                     if (widthMatch) styleAttr += `width:${widthMatch[1]}px;`;
                     if (heightMatch) styleAttr += `height:${heightMatch[1]}px;`;
+                    styleAttr += `object-fit:contain;`;
                     if (styleAttr) child.setAttribute("style", styleAttr);
                     continue;
                 }
@@ -401,7 +425,7 @@
         function onResizeMove(event) {
             if (!resizeState || !selectedImg) return;
             const lh = getLineHeight();
-
+            
             const deltaY = event.clientY - resizeState.startY;
             const rawHeight = resizeState.startHeight + deltaY;
             const lineCount = Math.max(1, Math.round(rawHeight / lh));
