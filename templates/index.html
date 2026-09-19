@@ -190,18 +190,26 @@
         function snapImageToLines(img) {
             const lh = getLineHeight();
 
-            // Base the snap on the existing explicit height when present so repeated
-            // calls (on every keystroke / ResizeObserver tick) are idempotent and
-            // don't drift. Otherwise fall back to natural/rendered size.
-            const existingHeight = parseFloat(img.style.height);
             const existingWidth = parseFloat(img.style.width);
             const naturalRatio = img.naturalWidth && img.naturalHeight
                 ? img.naturalWidth / img.naturalHeight
                 : null;
 
-            const baseHeight = existingHeight > 0
-                ? existingHeight
-                : (img.getBoundingClientRect().height || img.naturalHeight || img.offsetHeight);
+            // max-width:100% only clamps WIDTH, never height, so on a narrow/mobile
+            // viewport an image whose inline width/height were set on a wider screen
+            // gets visually squashed inside its own (unchanged) height box instead
+            // of reflowing to more lines. Detect that by comparing the box's actual
+            // rendered width (post-clamp) against the CSS width we last stored.
+            const rect = img.getBoundingClientRect();
+            const renderedWidth = rect.width || img.offsetWidth;
+            const isClamped = existingWidth > 0 && renderedWidth > 0 && renderedWidth < existingWidth - 0.5;
+
+            // When clamped, derive height from the clamped width + aspect ratio
+            // (what the image should actually be), not from the current rendered
+            // height, which hasn't moved and no longer matches the clamped width.
+            const baseHeight = isClamped && naturalRatio
+                ? renderedWidth / naturalRatio
+                : (rect.height || img.naturalHeight || img.offsetHeight);
 
             if (!(baseHeight > 0)) return;
 
@@ -210,16 +218,158 @@
 
             img.style.height = `${snappedHeight}px`;
 
-            // Preserve an explicit width the user already set (e.g. via the
-            // width-only edge handle) instead of forcing it back to the natural
-            // aspect ratio on every re-snap. Only derive width from the ratio when
-            // there isn't one yet (freshly inserted image).
             if (!(existingWidth > 0)) {
+                // Freshly inserted image: derive width from natural ratio.
                 if (naturalRatio) {
                     img.style.width = `${Math.round(snappedHeight * naturalRatio)}px`;
                 }
+            } else if (isClamped) {
+                // Bring the stored width down to what's actually rendering, so this
+                // stays consistent (and idempotent) next time this runs, and so the
+                // stored size round-trips correctly through sanitize/sync.
+                img.style.width = `${Math.round(renderedWidth)}px`;
             }
             img.style.objectFit = "contain";
+        }
+
+        // Returns the number of visual rows the editor's content actually occupies,
+        // by measuring real client rects for every text run and every image instead
+        // of estimating from total scrollHeight / lineHeight (which drifts under
+        // sub-pixel rounding, wrapped text, and images whose height isn't an exact
+        // multiple of the line height - as seen by the mobile vs desktop drift).
+        // Returns the last block element (direct child of the editor, or the
+        // editor itself for plain text/br content) that contains real content:
+        // non-whitespace text or an image. Used to trim trailing blank lines
+        // (e.g. leftover empty <div><br></div> rows from editing history) out of
+        // the gutter count, so the numbering doesn't run on past what was
+        // actually typed.
+        function lastContentBlock() {
+            const blocks = Array.from(area.childNodes);
+            for (let i = blocks.length - 1; i >= 0; i--) {
+                const node = blocks[i];
+                if (node.nodeType === Node.ELEMENT_NODE && node.tagName === "IMG") return node;
+                const hasText = (node.textContent || "").trim().length > 0;
+                const hasImg = node.nodeType === Node.ELEMENT_NODE && node.querySelector && node.querySelector("img");
+                if (hasText || hasImg) return node;
+            }
+            return null;
+        }
+
+        function countVisualRows() {
+            const lh = getLineHeight();
+            if (!area.firstChild) return 1;
+
+            // Trailing blank lines (empty <div><br></div> rows left over from
+            // editing/sync history) shouldn't extend the gutter past what was
+            // actually typed. Find the lowest point worth counting up to: the
+            // bottom of the last block with real content, or - if the caret is
+            // actively positioned further down, e.g. the user just pressed Enter
+            // onto a fresh blank line - the bottom of the caret's own block, so a
+            // line you're actively on still shows immediately.
+            let cutoffBottom = Infinity;
+            const contentBlock = lastContentBlock();
+            if (contentBlock) {
+                const rect = contentBlock.nodeType === Node.ELEMENT_NODE
+                    ? contentBlock.getBoundingClientRect()
+                    : null;
+                if (rect) cutoffBottom = rect.bottom;
+            }
+            const selection = window.getSelection();
+            if (document.activeElement === area && selection && selection.rangeCount > 0) {
+                const caretNode = selection.getRangeAt(0).startContainer;
+                if (area.contains(caretNode)) {
+                    const caretRange = document.createRange();
+                    caretRange.selectNodeContents(caretNode);
+                    const rects = caretRange.getClientRects();
+                    if (rects.length) {
+                        cutoffBottom = Math.max(cutoffBottom, rects[rects.length - 1].bottom);
+                    } else {
+                        // Empty block (just a <br>): use the block element's own rect.
+                        let el = caretNode.nodeType === Node.ELEMENT_NODE ? caretNode : caretNode.parentElement;
+                        if (el && area.contains(el)) {
+                            cutoffBottom = Math.max(cutoffBottom, el.getBoundingClientRect().bottom);
+                        }
+                    }
+                }
+            }
+            if (cutoffBottom === Infinity) {
+                // No content and nothing focused (e.g. programmatic update while
+                // blurred): fall back to the editor's own content height.
+                cutoffBottom = area.getBoundingClientRect().top + (area.scrollHeight - 52);
+            }
+
+            const rowTops = [];
+            const addRect = rect => {
+                if (rect.height === 0 && rect.width === 0) return; // collapsed/empty
+                if (rect.top > cutoffBottom + 1) return; // past the last real/active line
+                // Bucket by top position (rounded) so rects belonging to the same
+                // visual row don't get counted twice.
+                const top = Math.round(rect.top);
+                if (!rowTops.length || Math.abs(top - rowTops[rowTops.length - 1]) > 1) {
+                    // Only push if this top hasn't been seen already (handles
+                    // interleaved inline nodes on the same row).
+                    if (!rowTops.some(t => Math.abs(t - top) <= 1)) rowTops.push(top);
+                } else if (!rowTops.includes(top)) {
+                    rowTops.push(top);
+                }
+            };
+
+            const range = document.createRange();
+            const walker = document.createTreeWalker(
+                area,
+                NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT,
+                {
+                    acceptNode(node) {
+                        if (node.nodeType === Node.TEXT_NODE) return NodeFilter.FILTER_ACCEPT;
+                        if (node.nodeType === Node.ELEMENT_NODE && node.tagName === "IMG") return NodeFilter.FILTER_ACCEPT;
+                        if (node.nodeType === Node.ELEMENT_NODE && node.tagName === "BR") return NodeFilter.FILTER_ACCEPT;
+                        return NodeFilter.FILTER_SKIP;
+                    }
+                }
+            );
+
+            let node;
+            let sawAny = false;
+            while ((node = walker.nextNode())) {
+                sawAny = true;
+                if (node.nodeType === Node.TEXT_NODE) {
+                    if (!node.nodeValue || !node.nodeValue.length) continue;
+                    range.selectNodeContents(node);
+                    const rects = range.getClientRects();
+                    for (const rect of rects) addRect(rect);
+                } else {
+                    // IMG or BR: use its own bounding rect(s) as a row marker.
+                    const rects = node.getClientRects ? node.getClientRects() : [node.getBoundingClientRect()];
+                    for (const rect of rects) {
+                        addRect(rect);
+                        // An image is snapped to an exact multiple of the line
+                        // height and spans that many rows, but it only produces one
+                        // bounding rect - synthesize the remaining row-tops it
+                        // occupies so the gutter gets one number per line of image
+                        // height, not just one number for the whole image.
+                        if (node.tagName === "IMG" && rect.height > lh * 1.5) {
+                            const extraRows = Math.round(rect.height / lh) - 1;
+                            for (let i = 1; i <= extraRows; i++) {
+                                addRect({ top: rect.top + i * lh, height: lh, width: rect.width });
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (!sawAny) return 1;
+
+            rowTops.sort((a, b) => a - b);
+            // Merge tops that are within half a line-height of each other (handles
+            // an image and adjacent text baseline sitting on the "same" row).
+            const merged = [];
+            for (const top of rowTops) {
+                if (!merged.length || top - merged[merged.length - 1] > lh * 0.5) {
+                    merged.push(top);
+                }
+            }
+
+            return Math.max(1, merged.length);
         }
 
         function updateGutters() {
@@ -234,9 +384,9 @@
                 snapImageToLines(img);
             });
 
-            // Calculate overall visual line count based on total content scroll height
-            const contentHeight = Math.max(lh, area.scrollHeight - 52); // account for padding
-            const totalLines = Math.max(1, Math.round(contentHeight / lh));
+            // Count actual rendered rows rather than estimating from height, so the
+            // gutter matches real wrap points on any screen size / zoom level.
+            const totalLines = countVisualRows();
 
             let result = "";
             for (let i = 1; i <= totalLines; i++) {
