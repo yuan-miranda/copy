@@ -35,7 +35,6 @@ PASTE_PATH = Path(__file__).resolve().with_name("pastebin.txt")
 PASTE_IMAGES_DIR = Path(__file__).resolve().parent / "pastebin_images"
 PASTE_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 
-# Allowed image mime-types and extensions mapping
 ALLOWED_IMAGE_TYPES = {
     "image/png": ".png",
     "image/jpeg": ".jpg",
@@ -61,7 +60,6 @@ send_lock = threading.Lock()
 
 
 def load_saved_paste():
-    """Loads saved paste content from disk if available."""
     global paste_text
     if PASTE_PATH.is_file():
         try:
@@ -70,17 +68,19 @@ def load_saved_paste():
             logger.warning("Could not load pastebin.txt: %s", error)
 
 
-def broadcast_paste(payload, exclude=None):
-    """Broadcasts updates to all connected WebSocket clients."""
-    data = json.dumps(payload)
+def broadcast_state(exclude=None):
+    """Broadcasts paste text and active user count to all connected clients."""
     with paste_clients_lock:
+        user_count = len(paste_clients)
         sockets = list(paste_clients)
+        
+    payload = json.dumps({"type": "update", "text": paste_text, "users": user_count})
     for websocket in sockets:
         if websocket is exclude:
             continue
         try:
             with send_lock:
-                websocket.send(data)
+                websocket.send(payload)
         except Exception:
             with paste_clients_lock:
                 paste_clients.discard(websocket)
@@ -93,7 +93,6 @@ load_saved_paste()
 
 @app.get("/")
 def pastebin_page():
-    """Loads the pastebin app directly at the root endpoint."""
     return render_template("index.html", paste_text=paste_text)
 
 
@@ -137,9 +136,16 @@ def pastebin_websocket(ws):
     global paste_text
     with paste_clients_lock:
         paste_clients.add(ws)
+    
+    # Broadcast new user count on connect
+    broadcast_state()
+
     try:
         with send_lock:
-            ws.send(json.dumps({"type": "update", "text": paste_text}))
+            with paste_clients_lock:
+                count = len(paste_clients)
+            ws.send(json.dumps({"type": "update", "text": paste_text, "users": count}))
+            
         while True:
             raw = ws.receive()
             if raw is None:
@@ -156,7 +162,7 @@ def pastebin_websocket(ws):
                         PASTE_PATH.write_text(text, encoding="utf-8")
                     except OSError as error:
                         logger.warning("Could not save pastebin.txt: %s", error)
-                broadcast_paste({"type": "update", "text": text}, exclude=ws)
+                broadcast_state(exclude=ws)
                 try:
                     with send_lock:
                         ws.send(json.dumps({"type": "saved"}))
@@ -167,6 +173,7 @@ def pastebin_websocket(ws):
     finally:
         with paste_clients_lock:
             paste_clients.discard(ws)
+        broadcast_state()
 
 
 if __name__ == "__main__":

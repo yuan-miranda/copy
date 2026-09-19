@@ -28,15 +28,15 @@
         }
 
         #gutters {
-            width: 45px;
-            padding: 12px 4px;
+            min-width: 45px;
+            padding: 12px 6px;
             background: #fdfdfd;
             border-right: 1px solid #eaeaea;
             color: #aaa;
             text-align: right;
             user-select: none;
             overflow: hidden;
-            font-size: 0.85rem;
+            font-size: 1rem;
             line-height: 1.5;
             white-space: pre;
         }
@@ -117,9 +117,9 @@
 
         #status {
             position: fixed;
-            left: 55px;
+            left: 60px;
             bottom: 6px;
-            font-size: 0.85rem;
+            font-size: 0.9rem;
             color: #666;
             z-index: 5;
             pointer-events: none;
@@ -129,7 +129,8 @@
             position: fixed;
             top: 8px;
             right: 12px;
-            font-size: 0.9rem;
+            font-size: 1rem;
+            font-weight: bold;
             color: #000;
             z-index: 5;
             user-select: none;
@@ -167,21 +168,27 @@
 
         function updateGutters() {
             const text = area.innerText || "";
-            let lines = text.split("\n").length;
-            if (lines < 1) lines = 1;
+            let linesCount = text.split("\n").length;
+            if (linesCount < 1) linesCount = 1;
+
+            // Account for image heights relative to line-height
+            const computedLineHeight = parseFloat(window.getComputedStyle(area).lineHeight) || 24;
+            const images = area.querySelectorAll("img");
+            images.forEach(img => {
+                const height = img.offsetHeight || img.getBoundingClientRect().height;
+                const imgLines = Math.max(1, Math.round(height / computedLineHeight));
+                linesCount += Math.max(0, imgLines - 1);
+            });
 
             let result = "";
-            for (let i = 1; i <= lines; i++) {
-                if (i <= 999) {
-                    result += i + "\n";
-                } else {
-                    // Fallback base-36 / alphabet style for numbers past 999 to keep it compact
-                    let overflowVal = i - 1000;
-                    let charCode = 97 + (overflowVal % 26);
-                    result += String.fromCharCode(charCode) + "\n";
-                }
+            for (let i = 1; i <= linesCount; i++) {
+                result += i + "\n";
             }
             gutters.textContent = result;
+
+            // Dynamically resize gutter width based on digit length
+            const digits = String(linesCount).length;
+            gutters.style.width = Math.max(45, digits * 10 + 16) + "px";
         }
 
         area.addEventListener("scroll", () => {
@@ -375,6 +382,7 @@
             const width = Math.max(20, resizeState.startWidth + (event.clientX - resizeState.startX));
             selectedImg.style.width = `${Math.round(width)}px`;
             positionHandle();
+            updateGutters();
         }
 
         function endResize(event) {
