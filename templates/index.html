@@ -2,7 +2,7 @@
 <html>
 
 <head>
-    <title>ELMS - Pastebin</title>
+    <title>ELMS</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
         * {
@@ -16,24 +16,45 @@
             height: 100%;
             background: #fff;
             overflow: hidden;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-size: 1rem;
+        }
+
+        .container {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            background: #fff;
+        }
+
+        #gutters {
+            width: 45px;
+            padding: 12px 4px;
+            background: #fdfdfd;
+            border-right: 1px solid #eaeaea;
+            color: #aaa;
+            text-align: right;
+            user-select: none;
+            overflow: hidden;
+            font-size: 0.85rem;
+            line-height: 1.5;
+            white-space: pre;
         }
 
         #paste {
-            position: absolute;
-            inset: 0;
-            width: 100%;
+            flex: 1;
             height: 100%;
             overflow-y: auto;
             border: none;
             outline: none;
             background: #fff;
             color: #000;
-            font: 14px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
             padding: 12px;
             padding-bottom: 40px;
             white-space: pre-wrap;
             word-wrap: break-word;
             overflow-wrap: break-word;
+            line-height: 1.5;
         }
 
         #paste:empty::before {
@@ -49,6 +70,7 @@
             margin: 8px 0;
             border: 1px solid #ccc;
             vertical-align: middle;
+            cursor: default;
         }
 
         #paste img.img-selected {
@@ -70,7 +92,7 @@
 
         .bar {
             position: fixed;
-            right: 6px;
+            right: 12px;
             bottom: 6px;
             display: flex;
             gap: 6px;
@@ -83,7 +105,8 @@
             background: #f8f8f8;
             color: #000;
             font: inherit;
-            font-size: 12px;
+            font-size: 1rem;
+            font-weight: bold;
             cursor: pointer;
             border-radius: 3px;
         }
@@ -94,11 +117,22 @@
 
         #status {
             position: fixed;
-            left: 8px;
+            left: 55px;
             bottom: 6px;
-            font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-size: 0.85rem;
             color: #666;
             z-index: 5;
+            pointer-events: none;
+        }
+
+        #user-count {
+            position: fixed;
+            top: 8px;
+            right: 12px;
+            font-size: 0.9rem;
+            color: #000;
+            z-index: 5;
+            user-select: none;
             pointer-events: none;
         }
 
@@ -109,20 +143,50 @@
 </head>
 
 <body>
-    <div id="paste" contenteditable="true" spellcheck="false"
-        data-placeholder="Paste or type here... (images can be pasted or dropped too)"></div>
+    <div class="container">
+        <div id="gutters">1</div>
+        <div id="paste" contenteditable="true" spellcheck="false"
+            data-placeholder="Paste or type here... (images can be pasted or dropped too)"></div>
+    </div>
     <div id="status"></div>
+    <div id="user-count">1</div>
     <div class="bar">
         <button onclick="copyText()">Copy</button>
     </div>
     <script>
         const area = document.getElementById("paste");
+        const gutters = document.getElementById("gutters");
         const status = document.getElementById("status");
+        const userCountEl = document.getElementById("user-count");
+
         let socket = null;
         let saveTimer = null;
         let savedFadeTimer = null;
         let reconnectTimer = null;
         let pageCaching = false;
+
+        function updateGutters() {
+            const text = area.innerText || "";
+            let lines = text.split("\n").length;
+            if (lines < 1) lines = 1;
+
+            let result = "";
+            for (let i = 1; i <= lines; i++) {
+                if (i <= 999) {
+                    result += i + "\n";
+                } else {
+                    // Fallback base-36 / alphabet style for numbers past 999 to keep it compact
+                    let overflowVal = i - 1000;
+                    let charCode = 97 + (overflowVal % 26);
+                    result += String.fromCharCode(charCode) + "\n";
+                }
+            }
+            gutters.textContent = result;
+        }
+
+        area.addEventListener("scroll", () => {
+            gutters.scrollTop = area.scrollTop;
+        });
 
         function setStatus(text) {
             clearTimeout(savedFadeTimer);
@@ -175,10 +239,14 @@
                 if (data.type === "update" && document.activeElement !== area) {
                     deselectImage();
                     area.innerHTML = sanitizeHtml(data.text || "");
+                    updateGutters();
                 }
                 if (data.type === "saved") {
                     setStatus("Saved");
                     savedFadeTimer = setTimeout(() => { status.textContent = ""; }, 1200);
+                }
+                if (data.users !== undefined) {
+                    userCountEl.textContent = data.users;
                 }
             };
             socket.onclose = () => {
@@ -205,6 +273,7 @@
         });
 
         area.addEventListener("input", () => {
+            updateGutters();
             setStatus("Syncing...");
             clearTimeout(saveTimer);
             saveTimer = setTimeout(sendHtml, 300);
@@ -254,6 +323,7 @@
             img.src = url;
             img.alt = "pasted image";
             insertNodeAtRange(img, range);
+            updateGutters();
             area.dispatchEvent(new Event("input"));
         }
 
@@ -312,6 +382,7 @@
             resizeHandle.removeEventListener("pointermove", onResizeMove);
             resizeHandle.removeEventListener("pointerup", endResize);
             resizeState = null;
+            updateGutters();
             area.dispatchEvent(new Event("input"));
         }
 
@@ -328,9 +399,11 @@
             if (!area.contains(event.target)) deselectImage();
         });
 
-        area.addEventListener("scroll", positionHandle);
+        area.addEventListener("scroll", () => {
+            positionHandle();
+            gutters.scrollTop = area.scrollTop;
+        });
         window.addEventListener("resize", positionHandle);
-        window.addEventListener("scroll", positionHandle, true);
 
         const IMAGE_EXTENSION_RE = /\.(png|jpe?g|gif|webp|bmp|avif|svg|heic|heif)$/i;
 
@@ -372,6 +445,7 @@
             if (text) {
                 event.preventDefault();
                 insertTextAtRange(text, getEditableRange());
+                updateGutters();
                 area.dispatchEvent(new Event("input"));
             }
         });
@@ -418,6 +492,8 @@
                 savedFadeTimer = setTimeout(() => { status.textContent = ""; }, 2000);
             }
         });
+
+        updateGutters();
     </script>
 </body>
 
