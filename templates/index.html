@@ -80,14 +80,31 @@
 
         .resize-handle {
             position: fixed;
-            width: 12px;
-            height: 12px;
             background: #0078d4;
             border: 1px solid #fff;
             box-sizing: border-box;
-            cursor: se-resize;
             z-index: 10;
             touch-action: none;
+        }
+
+        .resize-handle.corner {
+            width: 12px;
+            height: 12px;
+            cursor: se-resize;
+        }
+
+        .resize-handle.edge-right {
+            width: 8px;
+            height: 28px;
+            border-radius: 2px;
+            cursor: e-resize;
+        }
+
+        .resize-handle.edge-bottom {
+            width: 28px;
+            height: 8px;
+            border-radius: 2px;
+            cursor: s-resize;
         }
 
         .bar {
@@ -174,9 +191,10 @@
             const lh = getLineHeight();
 
             // Base the snap on the existing explicit height when present so repeated
-            // calls (on every keystroke via updateGutters) are idempotent and don't
-            // drift. Otherwise fall back to natural/rendered size.
+            // calls (on every keystroke / ResizeObserver tick) are idempotent and
+            // don't drift. Otherwise fall back to natural/rendered size.
             const existingHeight = parseFloat(img.style.height);
+            const existingWidth = parseFloat(img.style.width);
             const naturalRatio = img.naturalWidth && img.naturalHeight
                 ? img.naturalWidth / img.naturalHeight
                 : null;
@@ -192,11 +210,14 @@
 
             img.style.height = `${snappedHeight}px`;
 
-            // Always pair height with an explicit width, otherwise object-fit has
-            // nothing to contain against and the size drifts or is dropped by the
-            // sanitizer on the next sync round-trip.
-            if (naturalRatio) {
-                img.style.width = `${Math.round(snappedHeight * naturalRatio)}px`;
+            // Preserve an explicit width the user already set (e.g. via the
+            // width-only edge handle) instead of forcing it back to the natural
+            // aspect ratio on every re-snap. Only derive width from the ratio when
+            // there isn't one yet (freshly inserted image).
+            if (!(existingWidth > 0)) {
+                if (naturalRatio) {
+                    img.style.width = `${Math.round(snappedHeight * naturalRatio)}px`;
+                }
             }
             img.style.objectFit = "contain";
         }
@@ -204,9 +225,14 @@
         function updateGutters() {
             const lh = getLineHeight();
 
-            // Snap images first
+            // Snap images first (skip whichever image is actively being dragged -
+            // its own resize handler already keeps it snapped, and re-snapping here
+            // from a ResizeObserver callback while it's mid-drag would fight the drag).
             const images = area.querySelectorAll("img");
-            images.forEach(img => snapImageToLines(img));
+            images.forEach(img => {
+                if (resizeState && img === selectedImg) return;
+                snapImageToLines(img);
+            });
 
             // Calculate overall visual line count based on total content scroll height
             const contentHeight = Math.max(lh, area.scrollHeight - 52); // account for padding
@@ -226,6 +252,20 @@
         area.addEventListener("scroll", () => {
             gutters.scrollTop = area.scrollTop;
         });
+
+        // Catch-all: any layout change to the editor's content box (image resize,
+        // font load, window resize, text reflow that doesn't fire "input", etc.)
+        // re-syncs the gutter automatically instead of relying on us remembering
+        // to call updateGutters() after every possible mutation.
+        let guttersRaf = null;
+        const guttersObserver = new ResizeObserver(() => {
+            if (guttersRaf) return;
+            guttersRaf = requestAnimationFrame(() => {
+                guttersRaf = null;
+                updateGutters();
+            });
+        });
+        guttersObserver.observe(area);
 
         function setStatus(text) {
             clearTimeout(savedFadeTimer);
@@ -377,14 +417,30 @@
         }
 
         let selectedImg = null;
-        let resizeHandle = null;
+        let resizeHandles = null; // { corner, right, bottom }
         let resizeState = null;
 
-        function positionHandle() {
-            if (!selectedImg || !resizeHandle) return;
+        function positionHandles() {
+            if (!selectedImg || !resizeHandles) return;
             const rect = selectedImg.getBoundingClientRect();
-            resizeHandle.style.left = `${rect.right - 6}px`;
-            resizeHandle.style.top = `${rect.bottom - 6}px`;
+            resizeHandles.corner.style.left = `${rect.right - 6}px`;
+            resizeHandles.corner.style.top = `${rect.bottom - 6}px`;
+
+            resizeHandles.right.style.left = `${rect.right - 4}px`;
+            resizeHandles.right.style.top = `${rect.top + rect.height / 2 - 14}px`;
+
+            resizeHandles.bottom.style.left = `${rect.left + rect.width / 2 - 14}px`;
+            resizeHandles.bottom.style.top = `${rect.bottom - 4}px`;
+        }
+        // Back-compat alias (referenced elsewhere as positionHandle).
+        function positionHandle() { positionHandles(); }
+
+        function makeHandle(className, mode) {
+            const handle = document.createElement("div");
+            handle.className = `resize-handle ${className}`;
+            document.body.appendChild(handle);
+            handle.addEventListener("pointerdown", event => startResize(event, mode, handle));
+            return handle;
         }
 
         function selectImage(img) {
@@ -392,59 +448,100 @@
             deselectImage();
             selectedImg = img;
             selectedImg.classList.add("img-selected");
-            resizeHandle = document.createElement("div");
-            resizeHandle.className = "resize-handle";
-            document.body.appendChild(resizeHandle);
-            positionHandle();
-            resizeHandle.addEventListener("pointerdown", startResize);
+            resizeHandles = {
+                corner: makeHandle("corner", "both"),
+                right: makeHandle("edge-right", "width"),
+                bottom: makeHandle("edge-bottom", "height")
+            };
+            positionHandles();
         }
 
         function deselectImage() {
             if (selectedImg) selectedImg.classList.remove("img-selected");
-            if (resizeHandle) resizeHandle.remove();
+            if (resizeHandles) {
+                resizeHandles.corner.remove();
+                resizeHandles.right.remove();
+                resizeHandles.bottom.remove();
+            }
             selectedImg = null;
-            resizeHandle = null;
+            resizeHandles = null;
         }
 
-        function startResize(event) {
+        function startResize(event, mode, handle) {
             if (!selectedImg) return;
             event.preventDefault();
             event.stopPropagation();
             resizeState = {
+                mode, // "width" | "height" | "both"
                 startX: event.clientX,
                 startY: event.clientY,
                 startWidth: selectedImg.getBoundingClientRect().width,
                 startHeight: selectedImg.getBoundingClientRect().height,
                 aspectRatio: selectedImg.naturalWidth / selectedImg.naturalHeight || 1
             };
-            resizeHandle.setPointerCapture(event.pointerId);
-            resizeHandle.addEventListener("pointermove", onResizeMove);
-            resizeHandle.addEventListener("pointerup", endResize);
+            handle.setPointerCapture(event.pointerId);
+            handle.addEventListener("pointermove", onResizeMove);
+            handle.addEventListener("pointerup", endResize);
+        }
+
+        // A "char width" step for width-only resizing, so dragging the right edge
+        // snaps to the same monospace grid the gutter/text uses horizontally.
+        function getCharWidth() {
+            const probe = document.createElement("span");
+            probe.textContent = "0";
+            probe.style.cssText = "position:absolute;visibility:hidden;white-space:pre;font:inherit;";
+            area.appendChild(probe);
+            const width = probe.getBoundingClientRect().width || 8;
+            probe.remove();
+            return width;
         }
 
         function onResizeMove(event) {
             if (!resizeState || !selectedImg) return;
             const lh = getLineHeight();
-            
-            const deltaY = event.clientY - resizeState.startY;
-            const rawHeight = resizeState.startHeight + deltaY;
-            const lineCount = Math.max(1, Math.round(rawHeight / lh));
-            const snappedHeight = lineCount * lh;
+            const mode = resizeState.mode;
 
-            const snappedWidth = Math.round(snappedHeight * resizeState.aspectRatio);
+            let newHeight = resizeState.startHeight;
+            let newWidth = resizeState.startWidth;
 
-            selectedImg.style.height = `${snappedHeight}px`;
-            selectedImg.style.width = `${snappedWidth}px`;
+            if (mode === "height" || mode === "both") {
+                const deltaY = event.clientY - resizeState.startY;
+                const rawHeight = resizeState.startHeight + deltaY;
+                const lineCount = Math.max(1, Math.round(rawHeight / lh));
+                newHeight = lineCount * lh;
+            }
+
+            if (mode === "width" || mode === "both") {
+                const deltaX = event.clientX - resizeState.startX;
+                const rawWidth = resizeState.startWidth + deltaX;
+                if (mode === "width") {
+                    // Free-ish width-only resize, snapped to a character-width grid
+                    // so it stays visually aligned with the monospace text grid.
+                    const cw = getCharWidth();
+                    const charCount = Math.max(1, Math.round(rawWidth / cw));
+                    newWidth = charCount * cw;
+                } else {
+                    newWidth = Math.round(newHeight * resizeState.aspectRatio);
+                }
+            }
+
+            if (mode === "both") {
+                newWidth = Math.round(newHeight * resizeState.aspectRatio);
+            }
+
+            selectedImg.style.height = `${Math.max(lh, newHeight)}px`;
+            selectedImg.style.width = `${Math.max(4, newWidth)}px`;
             selectedImg.style.objectFit = "contain";
 
-            positionHandle();
+            positionHandles();
             updateGutters();
         }
 
         function endResize(event) {
-            resizeHandle.releasePointerCapture(event.pointerId);
-            resizeHandle.removeEventListener("pointermove", onResizeMove);
-            resizeHandle.removeEventListener("pointerup", endResize);
+            const handle = event.currentTarget;
+            handle.releasePointerCapture(event.pointerId);
+            handle.removeEventListener("pointermove", onResizeMove);
+            handle.removeEventListener("pointerup", endResize);
             resizeState = null;
             updateGutters();
             area.dispatchEvent(new Event("input"));
@@ -459,7 +556,11 @@
         });
 
         document.addEventListener("click", event => {
-            if (event.target === resizeHandle) return;
+            if (resizeHandles && (
+                event.target === resizeHandles.corner ||
+                event.target === resizeHandles.right ||
+                event.target === resizeHandles.bottom
+            )) return;
             if (!area.contains(event.target)) deselectImage();
         });
 
