@@ -66,8 +66,8 @@
         #paste img {
             max-width: 100%;
             height: auto;
-            display: inline-block;
-            margin: 8px 0;
+            display: block;
+            margin: 0;
             border: 1px solid #ccc;
             vertical-align: middle;
             cursor: default;
@@ -166,29 +166,64 @@
         let reconnectTimer = null;
         let pageCaching = false;
 
-        function updateGutters() {
-            const text = area.innerText || "";
-            let linesCount = text.split("\n").length;
-            if (linesCount < 1) linesCount = 1;
+        function getLineHeight() {
+            return parseFloat(window.getComputedStyle(area).lineHeight) || 24;
+        }
 
-            // Account for image heights relative to line-height
-            const computedLineHeight = parseFloat(window.getComputedStyle(area).lineHeight) || 24;
-            const images = area.querySelectorAll("img");
-            images.forEach(img => {
-                const height = img.offsetHeight || img.getBoundingClientRect().height;
-                const imgLines = Math.max(1, Math.round(height / computedLineHeight));
-                linesCount += Math.max(0, imgLines - 1);
-            });
-
-            let result = "";
-            for (let i = 1; i <= linesCount; i++) {
-                result += i + "\n";
+        function snapImageToLines(img) {
+            const lh = getLineHeight();
+            const currentHeight = img.getBoundingClientRect().height || img.offsetHeight;
+            if (currentHeight > 0) {
+                const targetLines = Math.max(1, Math.round(currentHeight / lh));
+                const snappedHeight = targetLines * lh;
+                img.style.height = `${snappedHeight}px`;
+                img.style.objectFit = "contain";
             }
+        }
+
+        function updateGutters() {
+            const lh = getLineHeight();
+            let currentLineNumber = 1;
+            let result = "";
+
+            // Snap images first
+            const images = area.querySelectorAll("img");
+            images.forEach(img => snapImageToLines(img));
+
+            // Traverse child nodes to map numbers and blank spans for images
+            const nodes = Array.from(area.childNodes);
+            if (nodes.length === 0) {
+                result = "1\n";
+            } else {
+                nodes.forEach(node => {
+                    if (node.nodeType === Node.ELEMENT_NODE && node.tagName === "IMG") {
+                        const imgHeight = node.getBoundingClientRect().height || node.offsetHeight;
+                        const lineSpan = Math.max(1, Math.round(imgHeight / lh));
+
+                        // First line gets the line number
+                        result += currentLineNumber++ + "\n";
+                        // Remaining image height gets empty blank lines in gutter
+                        for (let i = 1; i < lineSpan; i++) {
+                            result += "\n";
+                        }
+                    } else {
+                        const text = node.textContent || "";
+                        const textLines = text.split("\n");
+                        textLines.forEach((line, idx) => {
+                            if (idx > 0 || result === "") {
+                                result += currentLineNumber++ + "\n";
+                            }
+                        });
+                    }
+                });
+            }
+
+            if (!result) result = "1\n";
             gutters.textContent = result;
 
-            // Dynamically resize gutter width based on digit length
-            const digits = String(linesCount).length;
-            gutters.style.width = Math.max(45, digits * 10 + 16) + "px";
+            // Dynamically resize gutter width based on max digit length
+            const maxDigit = String(currentLineNumber).length;
+            gutters.style.width = Math.max(45, maxDigit * 10 + 16) + "px";
         }
 
         area.addEventListener("scroll", () => {
@@ -218,13 +253,16 @@
                     if (!/^\/pastebin-image\//.test(src)) { child.remove(); continue; }
                     const style = child.getAttribute("style") || "";
                     const widthMatch = /^\s*width:\s*(\d+(?:\.\d+)?)px;?\s*$/i.exec(style);
+                    const heightMatch = /^\s*height:\s*(\d+(?:\.\d+)?)px;?\s*$/i.exec(style);
+
                     for (const attr of Array.from(child.attributes)) {
                         if (attr.name !== "src" && attr.name !== "alt") child.removeAttribute(attr.name);
                     }
-                    if (widthMatch) {
-                        const width = Math.max(20, Math.min(4000, parseFloat(widthMatch[1])));
-                        child.setAttribute("style", `width:${width}px;`);
-                    }
+
+                    let styleAttr = "";
+                    if (widthMatch) styleAttr += `width:${widthMatch[1]}px;`;
+                    if (heightMatch) styleAttr += `height:${heightMatch[1]}px;`;
+                    if (styleAttr) child.setAttribute("style", styleAttr);
                     continue;
                 }
                 if (tag === "br" || tag === "div") {
@@ -329,9 +367,12 @@
             const img = document.createElement("img");
             img.src = url;
             img.alt = "pasted image";
+            img.onload = () => {
+                snapImageToLines(img);
+                updateGutters();
+                area.dispatchEvent(new Event("input"));
+            };
             insertNodeAtRange(img, range);
-            updateGutters();
-            area.dispatchEvent(new Event("input"));
         }
 
         let selectedImg = null;
@@ -370,7 +411,10 @@
             event.stopPropagation();
             resizeState = {
                 startX: event.clientX,
+                startY: event.clientY,
                 startWidth: selectedImg.getBoundingClientRect().width,
+                startHeight: selectedImg.getBoundingClientRect().height,
+                aspectRatio: selectedImg.naturalWidth / selectedImg.naturalHeight || 1
             };
             resizeHandle.setPointerCapture(event.pointerId);
             resizeHandle.addEventListener("pointermove", onResizeMove);
@@ -379,8 +423,21 @@
 
         function onResizeMove(event) {
             if (!resizeState || !selectedImg) return;
-            const width = Math.max(20, resizeState.startWidth + (event.clientX - resizeState.startX));
-            selectedImg.style.width = `${Math.round(width)}px`;
+            const lh = getLineHeight();
+
+            // Calculate height change snapped to line-height steps
+            const deltaY = event.clientY - resizeState.startY;
+            const rawHeight = resizeState.startHeight + deltaY;
+            const lineCount = Math.max(1, Math.round(rawHeight / lh));
+            const snappedHeight = lineCount * lh;
+
+            // Maintain width proportion
+            const snappedWidth = Math.round(snappedHeight * resizeState.aspectRatio);
+
+            selectedImg.style.height = `${snappedHeight}px`;
+            selectedImg.style.width = `${snappedWidth}px`;
+            selectedImg.style.objectFit = "contain";
+
             positionHandle();
             updateGutters();
         }
