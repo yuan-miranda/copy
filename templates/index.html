@@ -183,46 +183,23 @@
 
         function updateGutters() {
             const lh = getLineHeight();
-            let currentLineNumber = 1;
-            let result = "";
 
             // Snap images first
             const images = area.querySelectorAll("img");
             images.forEach(img => snapImageToLines(img));
 
-            // Traverse child nodes to map numbers and blank spans for images
-            const nodes = Array.from(area.childNodes);
-            if (nodes.length === 0) {
-                result = "1\n";
-            } else {
-                nodes.forEach(node => {
-                    if (node.nodeType === Node.ELEMENT_NODE && node.tagName === "IMG") {
-                        const imgHeight = node.getBoundingClientRect().height || node.offsetHeight;
-                        const lineSpan = Math.max(1, Math.round(imgHeight / lh));
+            // Calculate overall visual line count based on total content scroll height
+            const contentHeight = Math.max(lh, area.scrollHeight - 52); // account for padding
+            const totalLines = Math.max(1, Math.round(contentHeight / lh));
 
-                        // First line gets the line number
-                        result += currentLineNumber++ + "\n";
-                        // Remaining image height gets empty blank lines in gutter
-                        for (let i = 1; i < lineSpan; i++) {
-                            result += "\n";
-                        }
-                    } else {
-                        const text = node.textContent || "";
-                        const textLines = text.split("\n");
-                        textLines.forEach((line, idx) => {
-                            if (idx > 0 || result === "") {
-                                result += currentLineNumber++ + "\n";
-                            }
-                        });
-                    }
-                });
+            let result = "";
+            for (let i = 1; i <= totalLines; i++) {
+                result += i + "\n";
             }
-
-            if (!result) result = "1\n";
             gutters.textContent = result;
 
             // Dynamically resize gutter width based on max digit length
-            const maxDigit = String(currentLineNumber).length;
+            const maxDigit = String(totalLines).length;
             gutters.style.width = Math.max(45, maxDigit * 10 + 16) + "px";
         }
 
@@ -425,13 +402,11 @@
             if (!resizeState || !selectedImg) return;
             const lh = getLineHeight();
 
-            // Calculate height change snapped to line-height steps
             const deltaY = event.clientY - resizeState.startY;
             const rawHeight = resizeState.startHeight + deltaY;
             const lineCount = Math.max(1, Math.round(rawHeight / lh));
             const snappedHeight = lineCount * lh;
 
-            // Maintain width proportion
             const snappedWidth = Math.round(snappedHeight * resizeState.aspectRatio);
 
             selectedImg.style.height = `${snappedHeight}px`;
