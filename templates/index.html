@@ -2,7 +2,7 @@
 <html>
 
 <head>
-    <title>ELMS</title>
+    <title>TEST</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
         * {
@@ -85,6 +85,7 @@
             box-sizing: border-box;
             z-index: 10;
             touch-action: none;
+            display: none;
         }
 
         .resize-handle.corner {
@@ -169,47 +170,64 @@
     <div id="status"></div>
     <div id="user-count">1</div>
     <div class="bar">
-        <button onclick="copyText()">Copy</button>
+        <button id="copy-btn">Copy</button>
     </div>
+
     <script>
         const area = document.getElementById("paste");
         const gutters = document.getElementById("gutters");
-        const status = document.getElementById("status");
+        const statusEl = document.getElementById("status");
         const userCountEl = document.getElementById("user-count");
+        const copyBtn = document.getElementById("copy-btn");
 
         let socket = null;
         let saveTimer = null;
-        let savedFadeTimer = null;
+        let statusTimer = null;
         let reconnectTimer = null;
         let pageCaching = false;
+
+        let selectedImg = null;
+        let resizeState = null;
+
+        const handles = {
+            corner: createHandle("corner", "both"),
+            right: createHandle("edge-right", "width"),
+            bottom: createHandle("edge-bottom", "height")
+        };
+
+        function setStatus(text, duration = 0) {
+            clearTimeout(statusTimer);
+            statusEl.textContent = text;
+            if (duration > 0) {
+                statusTimer = setTimeout(() => { statusEl.textContent = ""; }, duration);
+            }
+        }
 
         function getLineHeight() {
             return parseFloat(window.getComputedStyle(area).lineHeight) || 24;
         }
 
+        function getCharWidth() {
+            const probe = document.createElement("span");
+            probe.textContent = "0";
+            probe.style.cssText = "position:absolute;visibility:hidden;white-space:pre;font:inherit;";
+            area.appendChild(probe);
+            const width = probe.getBoundingClientRect().width || 8;
+            probe.remove();
+            return width;
+        }
+
         function snapImageToLines(img) {
             const lh = getLineHeight();
-
+            const existingHeight = parseFloat(img.style.height);
             const existingWidth = parseFloat(img.style.width);
             const naturalRatio = img.naturalWidth && img.naturalHeight
                 ? img.naturalWidth / img.naturalHeight
                 : null;
 
-            // max-width:100% only clamps WIDTH, never height, so on a narrow/mobile
-            // viewport an image whose inline width/height were set on a wider screen
-            // gets visually squashed inside its own (unchanged) height box instead
-            // of reflowing to more lines. Detect that by comparing the box's actual
-            // rendered width (post-clamp) against the CSS width we last stored.
-            const rect = img.getBoundingClientRect();
-            const renderedWidth = rect.width || img.offsetWidth;
-            const isClamped = existingWidth > 0 && renderedWidth > 0 && renderedWidth < existingWidth - 0.5;
-
-            // When clamped, derive height from the clamped width + aspect ratio
-            // (what the image should actually be), not from the current rendered
-            // height, which hasn't moved and no longer matches the clamped width.
-            const baseHeight = isClamped && naturalRatio
-                ? renderedWidth / naturalRatio
-                : (rect.height || img.naturalHeight || img.offsetHeight);
+            const baseHeight = existingHeight > 0
+                ? existingHeight
+                : (img.getBoundingClientRect().height || img.naturalHeight || img.offsetHeight);
 
             if (!(baseHeight > 0)) return;
 
@@ -218,195 +236,131 @@
 
             img.style.height = `${snappedHeight}px`;
 
-            if (!(existingWidth > 0)) {
-                // Freshly inserted image: derive width from natural ratio.
-                if (naturalRatio) {
-                    img.style.width = `${Math.round(snappedHeight * naturalRatio)}px`;
-                }
-            } else if (isClamped) {
-                // Bring the stored width down to what's actually rendering, so this
-                // stays consistent (and idempotent) next time this runs, and so the
-                // stored size round-trips correctly through sanitize/sync.
-                img.style.width = `${Math.round(renderedWidth)}px`;
+            if (!(existingWidth > 0) && naturalRatio) {
+                img.style.width = `${Math.round(snappedHeight * naturalRatio)}px`;
             }
             img.style.objectFit = "contain";
         }
 
-        // Returns the number of visual rows the editor's content actually occupies,
-        // by measuring real client rects for every text run and every image instead
-        // of estimating from total scrollHeight / lineHeight (which drifts under
-        // sub-pixel rounding, wrapped text, and images whose height isn't an exact
-        // multiple of the line height - as seen by the mobile vs desktop drift).
-        // Returns the last block element (direct child of the editor, or the
-        // editor itself for plain text/br content) that contains real content:
-        // non-whitespace text or an image. Used to trim trailing blank lines
-        // (e.g. leftover empty <div><br></div> rows from editing history) out of
-        // the gutter count, so the numbering doesn't run on past what was
-        // actually typed.
-        function lastContentBlock() {
-            const blocks = Array.from(area.childNodes);
-            for (let i = blocks.length - 1; i >= 0; i--) {
-                const node = blocks[i];
-                if (node.nodeType === Node.ELEMENT_NODE && node.tagName === "IMG") return node;
-                const hasText = (node.textContent || "").trim().length > 0;
-                const hasImg = node.nodeType === Node.ELEMENT_NODE && node.querySelector && node.querySelector("img");
-                if (hasText || hasImg) return node;
-            }
-            return null;
-        }
-
-        function countVisualRows() {
+        function getLogicalLineVisualIndices() {
             const lh = getLineHeight();
-            if (!area.firstChild) return 1;
+            const areaRect = area.getBoundingClientRect();
+            const style = window.getComputedStyle(area);
+            const paddingTop = parseFloat(style.paddingTop) || 12;
+            const areaTop = areaRect.top - area.scrollTop + paddingTop;
 
-            // Trailing blank lines (empty <div><br></div> rows left over from
-            // editing/sync history) shouldn't extend the gutter past what was
-            // actually typed. Find the lowest point worth counting up to: the
-            // bottom of the last block with real content, or - if the caret is
-            // actively positioned further down, e.g. the user just pressed Enter
-            // onto a fresh blank line - the bottom of the caret's own block, so a
-            // line you're actively on still shows immediately.
-            let cutoffBottom = Infinity;
-            const contentBlock = lastContentBlock();
-            if (contentBlock) {
-                const rect = contentBlock.nodeType === Node.ELEMENT_NODE
-                    ? contentBlock.getBoundingClientRect()
-                    : null;
-                if (rect) cutoffBottom = rect.bottom;
-            }
-            const selection = window.getSelection();
-            if (document.activeElement === area && selection && selection.rangeCount > 0) {
-                const caretNode = selection.getRangeAt(0).startContainer;
-                if (area.contains(caretNode)) {
-                    const caretRange = document.createRange();
-                    caretRange.selectNodeContents(caretNode);
-                    const rects = caretRange.getClientRects();
-                    if (rects.length) {
-                        cutoffBottom = Math.max(cutoffBottom, rects[rects.length - 1].bottom);
-                    } else {
-                        // Empty block (just a <br>): use the block element's own rect.
-                        let el = caretNode.nodeType === Node.ELEMENT_NODE ? caretNode : caretNode.parentElement;
-                        if (el && area.contains(el)) {
-                            cutoffBottom = Math.max(cutoffBottom, el.getBoundingClientRect().bottom);
-                        }
-                    }
-                }
-            }
-            if (cutoffBottom === Infinity) {
-                // No content and nothing focused (e.g. programmatic update while
-                // blurred): fall back to the editor's own content height.
-                cutoffBottom = area.getBoundingClientRect().top + (area.scrollHeight - 52);
+            const indices = [];
+
+            function addIndex(topPx) {
+                const relY = topPx - areaTop;
+                const idx = Math.max(0, Math.round(relY / lh));
+                indices.push(idx);
             }
 
-            const rowTops = [];
-            const addRect = rect => {
-                if (rect.height === 0 && rect.width === 0) return; // collapsed/empty
-                if (rect.top > cutoffBottom + 1) return; // past the last real/active line
-                // Bucket by top position (rounded) so rects belonging to the same
-                // visual row don't get counted twice.
-                const top = Math.round(rect.top);
-                if (!rowTops.length || Math.abs(top - rowTops[rowTops.length - 1]) > 1) {
-                    // Only push if this top hasn't been seen already (handles
-                    // interleaved inline nodes on the same row).
-                    if (!rowTops.some(t => Math.abs(t - top) <= 1)) rowTops.push(top);
-                } else if (!rowTops.includes(top)) {
-                    rowTops.push(top);
-                }
-            };
-
-            const range = document.createRange();
-            const walker = document.createTreeWalker(
-                area,
-                NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT,
-                {
-                    acceptNode(node) {
-                        if (node.nodeType === Node.TEXT_NODE) return NodeFilter.FILTER_ACCEPT;
-                        if (node.nodeType === Node.ELEMENT_NODE && node.tagName === "IMG") return NodeFilter.FILTER_ACCEPT;
-                        if (node.nodeType === Node.ELEMENT_NODE && node.tagName === "BR") return NodeFilter.FILTER_ACCEPT;
-                        return NodeFilter.FILTER_SKIP;
-                    }
-                }
-            );
-
-            let node;
-            let sawAny = false;
-            while ((node = walker.nextNode())) {
-                sawAny = true;
-                if (node.nodeType === Node.TEXT_NODE) {
-                    if (!node.nodeValue || !node.nodeValue.length) continue;
-                    range.selectNodeContents(node);
-                    const rects = range.getClientRects();
-                    for (const rect of rects) addRect(rect);
+            function getCharTop(textNode, offset) {
+                const range = document.createRange();
+                const len = textNode.nodeValue.length;
+                if (len === 0) {
+                    range.selectNode(textNode);
+                } else if (offset < len) {
+                    range.setStart(textNode, offset);
+                    range.setEnd(textNode, offset + 1);
                 } else {
-                    // IMG or BR: use its own bounding rect(s) as a row marker.
-                    const rects = node.getClientRects ? node.getClientRects() : [node.getBoundingClientRect()];
-                    for (const rect of rects) {
-                        addRect(rect);
-                        // An image is snapped to an exact multiple of the line
-                        // height and spans that many rows, but it only produces one
-                        // bounding rect - synthesize the remaining row-tops it
-                        // occupies so the gutter gets one number per line of image
-                        // height, not just one number for the whole image.
-                        if (node.tagName === "IMG" && rect.height > lh * 1.5) {
-                            const extraRows = Math.round(rect.height / lh) - 1;
-                            for (let i = 1; i <= extraRows; i++) {
-                                addRect({ top: rect.top + i * lh, height: lh, width: rect.width });
-                            }
+                    range.setStart(textNode, offset - 1);
+                    range.setEnd(textNode, offset);
+                }
+                const rects = range.getClientRects();
+                return rects.length > 0 ? rects[0].top : range.getBoundingClientRect().top;
+            }
+
+            function getNodeTop(node) {
+                if (node.nodeType === Node.ELEMENT_NODE) {
+                    return node.getBoundingClientRect().top;
+                }
+                return getCharTop(node, 0);
+            }
+
+            let atLineStart = true;
+
+            function walk(node) {
+                if (node.nodeType === Node.TEXT_NODE) {
+                    const text = node.nodeValue;
+                    for (let i = 0; i < text.length; i++) {
+                        if (atLineStart) {
+                            addIndex(getCharTop(node, i));
+                            atLineStart = false;
                         }
+                        if (text[i] === '\n') {
+                            atLineStart = true;
+                        }
+                    }
+                } else if (node.nodeType === Node.ELEMENT_NODE) {
+                    const tag = node.tagName.toLowerCase();
+
+                    if (tag === "br") {
+                        if (atLineStart) {
+                            addIndex(getNodeTop(node));
+                        }
+                        atLineStart = true;
+                    } else if (tag === "img") {
+                        const topPx = getNodeTop(node);
+                        const imgHeight = node.getBoundingClientRect().height || parseFloat(node.style.height) || lh;
+                        const lineCount = Math.max(1, Math.round(imgHeight / lh));
+                        const relY = topPx - areaTop;
+                        const baseIdx = Math.max(0, Math.round(relY / lh));
+
+                        for (let i = 0; i < lineCount; i++) {
+                            indices.push(baseIdx + i);
+                        }
+                        atLineStart = true;
+                    } else {
+                        const isBlock = window.getComputedStyle(node).display !== "inline";
+                        if (isBlock) atLineStart = true;
+
+                        for (const child of node.childNodes) {
+                            walk(child);
+                        }
+
+                        if (isBlock) atLineStart = true;
                     }
                 }
             }
 
-            if (!sawAny) return 1;
+            walk(area);
 
-            rowTops.sort((a, b) => a - b);
-            // Merge tops that are within half a line-height of each other (handles
-            // an image and adjacent text baseline sitting on the "same" row).
-            const merged = [];
-            for (const top of rowTops) {
-                if (!merged.length || top - merged[merged.length - 1] > lh * 0.5) {
-                    merged.push(top);
-                }
+            if (indices.length === 0) {
+                indices.push(0);
             }
 
-            return Math.max(1, merged.length);
+            return indices;
         }
 
         function updateGutters() {
             const lh = getLineHeight();
 
-            // Snap images first (skip whichever image is actively being dragged -
-            // its own resize handler already keeps it snapped, and re-snapping here
-            // from a ResizeObserver callback while it's mid-drag would fight the drag).
-            const images = area.querySelectorAll("img");
-            images.forEach(img => {
+            area.querySelectorAll("img").forEach(img => {
                 if (resizeState && img === selectedImg) return;
                 snapImageToLines(img);
             });
 
-            // Count actual rendered rows rather than estimating from height, so the
-            // gutter matches real wrap points on any screen size / zoom level.
-            const totalLines = countVisualRows();
+            const contentHeight = Math.max(lh, area.scrollHeight - 24);
+            const totalVisualLines = Math.max(1, Math.round(contentHeight / lh));
 
-            let result = "";
-            for (let i = 1; i <= totalLines; i++) {
-                result += i + "\n";
-            }
-            gutters.textContent = result;
+            const logicalIndices = getLogicalLineVisualIndices();
+            const lineNumbers = new Array(totalVisualLines).fill("");
 
-            // Dynamically resize gutter width based on max digit length
-            const maxDigit = String(totalLines).length;
-            gutters.style.width = Math.max(45, maxDigit * 10 + 16) + "px";
+            logicalIndices.forEach((visualIndex, logicalLineNum) => {
+                if (visualIndex < totalVisualLines && !lineNumbers[visualIndex]) {
+                    lineNumbers[visualIndex] = String(logicalLineNum + 1);
+                }
+            });
+
+            gutters.textContent = lineNumbers.join("\n");
+
+            const maxDigits = String(logicalIndices.length).length;
+            gutters.style.width = `${Math.max(45, maxDigits * 10 + 16)}px`;
         }
 
-        area.addEventListener("scroll", () => {
-            gutters.scrollTop = area.scrollTop;
-        });
-
-        // Catch-all: any layout change to the editor's content box (image resize,
-        // font load, window resize, text reflow that doesn't fire "input", etc.)
-        // re-syncs the gutter automatically instead of relying on us remembering
-        // to call updateGutters() after every possible mutation.
         let guttersRaf = null;
         const guttersObserver = new ResizeObserver(() => {
             if (guttersRaf) return;
@@ -416,11 +370,6 @@
             });
         });
         guttersObserver.observe(area);
-
-        function setStatus(text) {
-            clearTimeout(savedFadeTimer);
-            status.textContent = text;
-        }
 
         function sanitizeHtml(html) {
             const template = document.createElement("template");
@@ -438,22 +387,17 @@
                 if (tag === "img") {
                     const src = child.getAttribute("src") || "";
                     if (!/^\/pastebin-image\//.test(src)) { child.remove(); continue; }
-                    const style = child.getAttribute("style") || "";
-                    // Parse each declaration separately instead of anchoring the whole
-                    // string, since the style attribute holds width, height AND
-                    // object-fit together (e.g. "height:60px; width:80px; object-fit: contain;").
-                    const widthMatch = /(?:^|;)\s*width:\s*(\d+(?:\.\d+)?)px\s*(?:;|$)/i.exec(style);
-                    const heightMatch = /(?:^|;)\s*height:\s*(\d+(?:\.\d+)?)px\s*(?:;|$)/i.exec(style);
+
+                    const w = child.style.width;
+                    const h = child.style.height;
 
                     for (const attr of Array.from(child.attributes)) {
                         if (attr.name !== "src" && attr.name !== "alt") child.removeAttribute(attr.name);
                     }
 
-                    let styleAttr = "";
-                    if (widthMatch) styleAttr += `width:${widthMatch[1]}px;`;
-                    if (heightMatch) styleAttr += `height:${heightMatch[1]}px;`;
-                    styleAttr += `object-fit:contain;`;
-                    if (styleAttr) child.setAttribute("style", styleAttr);
+                    child.style.cssText = "object-fit:contain;";
+                    if (w) child.style.width = w;
+                    if (h) child.style.height = h;
                     continue;
                 }
                 if (tag === "br" || tag === "div") {
@@ -461,14 +405,15 @@
                     sanitizeChildren(child);
                     continue;
                 }
-                const text = document.createTextNode(child.textContent);
-                child.replaceWith(text);
+                child.replaceWith(document.createTextNode(child.textContent));
             }
         }
 
         function connect() {
             setStatus("Connecting...");
-            socket = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/pastebin-ws");
+            const protocol = location.protocol === "https:" ? "wss://" : "ws://";
+            socket = new WebSocket(`${protocol}${location.host}/pastebin-ws`);
+
             socket.onopen = () => setStatus("");
             socket.onmessage = event => {
                 const data = JSON.parse(event.data);
@@ -478,8 +423,7 @@
                     updateGutters();
                 }
                 if (data.type === "saved") {
-                    setStatus("Saved");
-                    savedFadeTimer = setTimeout(() => { status.textContent = ""; }, 1200);
+                    setStatus("Saved", 1200);
                 }
                 if (data.users !== undefined) {
                     userCountEl.textContent = data.users;
@@ -522,11 +466,10 @@
             }
         }
 
-        function copyText() {
+        copyBtn.addEventListener("click", () => {
             navigator.clipboard.writeText(area.textContent);
-            setStatus("Copied to clipboard");
-            savedFadeTimer = setTimeout(() => { status.textContent = ""; }, 1200);
-        }
+            setStatus("Copied to clipboard", 1200);
+        });
 
         function getEditableRange() {
             const selection = window.getSelection();
@@ -550,10 +493,6 @@
             selection.addRange(range);
         }
 
-        function insertTextAtRange(text, range) {
-            insertNodeAtRange(document.createTextNode(text), range);
-        }
-
         function insertImageAtRange(url, range) {
             const img = document.createElement("img");
             img.src = url;
@@ -566,31 +505,26 @@
             insertNodeAtRange(img, range);
         }
 
-        let selectedImg = null;
-        let resizeHandles = null; // { corner, right, bottom }
-        let resizeState = null;
-
-        function positionHandles() {
-            if (!selectedImg || !resizeHandles) return;
-            const rect = selectedImg.getBoundingClientRect();
-            resizeHandles.corner.style.left = `${rect.right - 6}px`;
-            resizeHandles.corner.style.top = `${rect.bottom - 6}px`;
-
-            resizeHandles.right.style.left = `${rect.right - 4}px`;
-            resizeHandles.right.style.top = `${rect.top + rect.height / 2 - 14}px`;
-
-            resizeHandles.bottom.style.left = `${rect.left + rect.width / 2 - 14}px`;
-            resizeHandles.bottom.style.top = `${rect.bottom - 4}px`;
-        }
-        // Back-compat alias (referenced elsewhere as positionHandle).
-        function positionHandle() { positionHandles(); }
-
-        function makeHandle(className, mode) {
+        function createHandle(className, mode) {
             const handle = document.createElement("div");
             handle.className = `resize-handle ${className}`;
-            document.body.appendChild(handle);
             handle.addEventListener("pointerdown", event => startResize(event, mode, handle));
+            document.body.appendChild(handle);
             return handle;
+        }
+
+        function positionHandles() {
+            if (!selectedImg) return;
+            const rect = selectedImg.getBoundingClientRect();
+
+            handles.corner.style.left = `${rect.right - 6}px`;
+            handles.corner.style.top = `${rect.bottom - 6}px`;
+
+            handles.right.style.left = `${rect.right - 4}px`;
+            handles.right.style.top = `${rect.top + rect.height / 2 - 14}px`;
+
+            handles.bottom.style.left = `${rect.left + rect.width / 2 - 14}px`;
+            handles.bottom.style.top = `${rect.bottom - 4}px`;
         }
 
         function selectImage(img) {
@@ -598,23 +532,15 @@
             deselectImage();
             selectedImg = img;
             selectedImg.classList.add("img-selected");
-            resizeHandles = {
-                corner: makeHandle("corner", "both"),
-                right: makeHandle("edge-right", "width"),
-                bottom: makeHandle("edge-bottom", "height")
-            };
             positionHandles();
+            Object.values(handles).forEach(h => h.style.display = "block");
         }
 
         function deselectImage() {
-            if (selectedImg) selectedImg.classList.remove("img-selected");
-            if (resizeHandles) {
-                resizeHandles.corner.remove();
-                resizeHandles.right.remove();
-                resizeHandles.bottom.remove();
-            }
+            if (!selectedImg) return;
+            selectedImg.classList.remove("img-selected");
             selectedImg = null;
-            resizeHandles = null;
+            Object.values(handles).forEach(h => h.style.display = "none");
         }
 
         function startResize(event, mode, handle) {
@@ -622,61 +548,41 @@
             event.preventDefault();
             event.stopPropagation();
             resizeState = {
-                mode, // "width" | "height" | "both"
+                mode,
                 startX: event.clientX,
                 startY: event.clientY,
                 startWidth: selectedImg.getBoundingClientRect().width,
                 startHeight: selectedImg.getBoundingClientRect().height,
-                aspectRatio: selectedImg.naturalWidth / selectedImg.naturalHeight || 1
+                aspectRatio: selectedImg.naturalWidth / selectedImg.naturalHeight || 1,
+                charWidth: getCharWidth()
             };
             handle.setPointerCapture(event.pointerId);
             handle.addEventListener("pointermove", onResizeMove);
             handle.addEventListener("pointerup", endResize);
         }
 
-        // A "char width" step for width-only resizing, so dragging the right edge
-        // snaps to the same monospace grid the gutter/text uses horizontally.
-        function getCharWidth() {
-            const probe = document.createElement("span");
-            probe.textContent = "0";
-            probe.style.cssText = "position:absolute;visibility:hidden;white-space:pre;font:inherit;";
-            area.appendChild(probe);
-            const width = probe.getBoundingClientRect().width || 8;
-            probe.remove();
-            return width;
-        }
-
         function onResizeMove(event) {
             if (!resizeState || !selectedImg) return;
             const lh = getLineHeight();
-            const mode = resizeState.mode;
+            const { mode, startX, startY, startWidth, startHeight, aspectRatio, charWidth } = resizeState;
 
-            let newHeight = resizeState.startHeight;
-            let newWidth = resizeState.startWidth;
+            let newHeight = startHeight;
+            let newWidth = startWidth;
 
             if (mode === "height" || mode === "both") {
-                const deltaY = event.clientY - resizeState.startY;
-                const rawHeight = resizeState.startHeight + deltaY;
-                const lineCount = Math.max(1, Math.round(rawHeight / lh));
+                const deltaY = event.clientY - startY;
+                const lineCount = Math.max(1, Math.round((startHeight + deltaY) / lh));
                 newHeight = lineCount * lh;
             }
 
             if (mode === "width" || mode === "both") {
-                const deltaX = event.clientX - resizeState.startX;
-                const rawWidth = resizeState.startWidth + deltaX;
+                const deltaX = event.clientX - startX;
                 if (mode === "width") {
-                    // Free-ish width-only resize, snapped to a character-width grid
-                    // so it stays visually aligned with the monospace text grid.
-                    const cw = getCharWidth();
-                    const charCount = Math.max(1, Math.round(rawWidth / cw));
-                    newWidth = charCount * cw;
+                    const charCount = Math.max(1, Math.round((startWidth + deltaX) / charWidth));
+                    newWidth = charCount * charWidth;
                 } else {
-                    newWidth = Math.round(newHeight * resizeState.aspectRatio);
+                    newWidth = Math.round(newHeight * aspectRatio);
                 }
-            }
-
-            if (mode === "both") {
-                newWidth = Math.round(newHeight * resizeState.aspectRatio);
             }
 
             selectedImg.style.height = `${Math.max(lh, newHeight)}px`;
@@ -697,35 +603,25 @@
             area.dispatchEvent(new Event("input"));
         }
 
-        area.addEventListener("click", event => {
-            if (event.target.tagName === "IMG" && area.contains(event.target)) {
-                selectImage(event.target);
-            } else {
+        document.addEventListener("click", event => {
+            const target = event.target;
+            if (target.tagName === "IMG" && area.contains(target)) {
+                selectImage(target);
+            } else if (!Object.values(handles).includes(target)) {
                 deselectImage();
             }
         });
 
-        document.addEventListener("click", event => {
-            if (resizeHandles && (
-                event.target === resizeHandles.corner ||
-                event.target === resizeHandles.right ||
-                event.target === resizeHandles.bottom
-            )) return;
-            if (!area.contains(event.target)) deselectImage();
-        });
-
         area.addEventListener("scroll", () => {
-            positionHandle();
             gutters.scrollTop = area.scrollTop;
+            positionHandles();
         });
-        window.addEventListener("resize", positionHandle);
+        window.addEventListener("resize", positionHandles);
 
         const IMAGE_EXTENSION_RE = /\.(png|jpe?g|gif|webp|bmp|avif|svg|heic|heif)$/i;
 
         function isImageFile(file) {
-            if (!file) return false;
-            if (file.type && file.type.startsWith("image/")) return true;
-            return IMAGE_EXTENSION_RE.test(file.name || "");
+            return file && (file.type?.startsWith("image/") || IMAGE_EXTENSION_RE.test(file.name || ""));
         }
 
         async function uploadImage(file, range) {
@@ -738,9 +634,8 @@
                 const data = await response.json();
                 insertImageAtRange(data.url, range);
                 setStatus("");
-            } catch (error) {
-                setStatus("Image upload failed");
-                savedFadeTimer = setTimeout(() => { status.textContent = ""; }, 2000);
+            } catch {
+                setStatus("Image upload failed", 2000);
             }
         }
 
@@ -756,30 +651,24 @@
                     }
                 }
             }
-            const text = event.clipboardData ? event.clipboardData.getData("text/plain") : "";
+            const text = event.clipboardData?.getData("text/plain");
             if (text) {
                 event.preventDefault();
-                insertTextAtRange(text, getEditableRange());
+                insertNodeAtRange(document.createTextNode(text), getEditableRange());
                 updateGutters();
                 area.dispatchEvent(new Event("input"));
             }
         });
 
-        area.addEventListener("dragenter", event => {
-            if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
-            event.preventDefault();
-            area.classList.add("drag-over");
+        ["dragenter", "dragover"].forEach(type => {
+            area.addEventListener(type, event => {
+                if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+                event.preventDefault();
+                area.classList.add("drag-over");
+            });
         });
 
-        area.addEventListener("dragover", event => {
-            if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
-            event.preventDefault();
-            area.classList.add("drag-over");
-        });
-
-        area.addEventListener("dragleave", () => {
-            area.classList.remove("drag-over");
-        });
+        area.addEventListener("dragleave", () => area.classList.remove("drag-over"));
 
         function rangeFromPoint(x, y) {
             if (document.caretRangeFromPoint) return document.caretRangeFromPoint(x, y);
@@ -799,12 +688,12 @@
             area.classList.remove("drag-over");
             const files = event.dataTransfer ? Array.from(event.dataTransfer.files) : [];
             const images = files.filter(isImageFile);
+
             if (images.length) {
                 const dropRange = rangeFromPoint(event.clientX, event.clientY) || getEditableRange();
                 images.forEach(file => uploadImage(file, dropRange.cloneRange()));
             } else if (files.length) {
-                setStatus("Dropped file isn't a recognized image");
-                savedFadeTimer = setTimeout(() => { status.textContent = ""; }, 2000);
+                setStatus("Dropped file isn't a recognized image", 2000);
             }
         });
 
