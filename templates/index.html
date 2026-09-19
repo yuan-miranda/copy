@@ -1,8 +1,10 @@
 <!doctype html>
-<html>
+<html lang="en">
 
 <head>
+    <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Pastebin</title>
     <style>
         * {
             box-sizing: border-box;
@@ -16,14 +18,12 @@
             background: #fff;
             overflow: hidden;
             font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-            font-size: 1rem;
         }
 
         .container {
             position: absolute;
             inset: 0;
             display: flex;
-            background: #fff;
         }
 
         #gutters {
@@ -35,7 +35,6 @@
             text-align: right;
             user-select: none;
             overflow: hidden;
-            font-size: 1rem;
             line-height: 1.5;
             white-space: pre;
         }
@@ -48,10 +47,8 @@
             outline: none;
             background: #fff;
             color: #000;
-            padding: 12px;
-            padding-bottom: 40px;
+            padding: 12px 12px 40px;
             white-space: pre-wrap;
-            word-wrap: break-word;
             overflow-wrap: break-word;
             line-height: 1.5;
         }
@@ -62,13 +59,15 @@
             pointer-events: none;
         }
 
+        #paste.drag-over {
+            background: #f0f4f8;
+        }
+
         #paste img {
             max-width: 100%;
             height: auto;
             display: block;
-            margin: 0;
             border: 1px solid #ccc;
-            vertical-align: middle;
             cursor: default;
         }
 
@@ -79,12 +78,11 @@
 
         .resize-handle {
             position: fixed;
+            display: none;
             background: #0078d4;
             border: 1px solid #fff;
-            box-sizing: border-box;
             z-index: 10;
             touch-action: none;
-            display: none;
         }
 
         .resize-handle.corner {
@@ -122,7 +120,6 @@
             background: #f8f8f8;
             color: #000;
             font: inherit;
-            font-size: 1rem;
             font-weight: bold;
             cursor: pointer;
             border-radius: 3px;
@@ -146,16 +143,11 @@
             position: fixed;
             top: 8px;
             right: 12px;
-            font-size: 1rem;
             font-weight: bold;
             color: #000;
             z-index: 5;
             user-select: none;
             pointer-events: none;
-        }
-
-        #paste.drag-over {
-            background: #f0f4f8;
         }
     </style>
 </head>
@@ -171,48 +163,30 @@
     <div class="bar">
         <button id="copy-btn">Copy</button>
         <button id="upload-btn">Upload Image</button>
-        <input type="file" id="file-input" accept="image/*" style="display: none;">
+        <input type="file" id="file-input" accept="image/*" hidden>
     </div>
 
     <script>
-        const area = document.getElementById("paste");
-        const gutters = document.getElementById("gutters");
-        const statusEl = document.getElementById("status");
-        const userCountEl = document.getElementById("user-count");
-        const copyBtn = document.getElementById("copy-btn");
-        const uploadBtn = document.getElementById("upload-btn");
-        const fileInput = document.getElementById("file-input");
+        const $ = id => document.getElementById(id);
+        const area = $("paste");
+        const gutters = $("gutters");
+        const statusEl = $("status");
+        const userCountEl = $("user-count");
+        const fileInput = $("file-input");
+
+        const IMAGE_EXTENSION_RE = /\.(png|jpe?g|gif|webp|bmp|avif|svg|heic|heif)$/i;
+        const IMAGE_URL_PREFIX = "/pastebin-image/";
 
         let socket = null;
         let saveTimer = null;
         let statusTimer = null;
         let reconnectTimer = null;
         let pageCaching = false;
-
         let selectedImg = null;
         let resizeState = null;
         let lastRange = null;
 
-        function saveSelection() {
-            const selection = window.getSelection();
-            if (selection && selection.rangeCount > 0) {
-                const range = selection.getRangeAt(0);
-                if (area.contains(range.commonAncestorContainer)) {
-                    lastRange = range.cloneRange();
-                }
-            }
-        }
-
-        document.addEventListener("selectionchange", saveSelection);
-        area.addEventListener("keyup", saveSelection);
-        area.addEventListener("mouseup", saveSelection);
-        area.addEventListener("touchend", saveSelection);
-
-        const handles = {
-            corner: createHandle("corner", "both"),
-            right: createHandle("edge-right", "width"),
-            bottom: createHandle("edge-bottom", "height")
-        };
+        // ---------- Helpers ----------
 
         function setStatus(text, duration = 0) {
             clearTimeout(statusTimer);
@@ -222,8 +196,13 @@
             }
         }
 
+        // Fires the normal input pipeline: gutter refresh + debounced sync to the server.
+        function notifyChange() {
+            area.dispatchEvent(new Event("input"));
+        }
+
         function getLineHeight() {
-            return parseFloat(window.getComputedStyle(area).lineHeight) || 24;
+            return parseFloat(getComputedStyle(area).lineHeight) || 24;
         }
 
         function getCharWidth() {
@@ -236,165 +215,171 @@
             return width;
         }
 
+        function isImageFile(file) {
+            return !!file && (file.type?.startsWith("image/") || IMAGE_EXTENSION_RE.test(file.name || ""));
+        }
+
+        // ---------- Selection tracking ----------
+
+        // The caret is lost when the user clicks a toolbar button, so remember
+        // the last position inside the editor for inserting uploaded images.
+        function currentAreaRange() {
+            const selection = getSelection();
+            if (!selection?.rangeCount) return null;
+            const range = selection.getRangeAt(0);
+            return area.contains(range.commonAncestorContainer) ? range : null;
+        }
+
+        document.addEventListener("selectionchange", () => {
+            const range = currentAreaRange();
+            if (range) lastRange = range.cloneRange();
+        });
+
+        function getEditableRange() {
+            const range = currentAreaRange();
+            if (range) return range.cloneRange();
+            if (lastRange) return lastRange.cloneRange();
+            const end = document.createRange();
+            end.selectNodeContents(area);
+            end.collapse(false);
+            return end;
+        }
+
+        function insertNodeAtRange(node, range) {
+            range.deleteContents();
+            range.insertNode(node);
+            range.setStartAfter(node);
+            range.collapse(true);
+            const selection = getSelection();
+            selection.removeAllRanges();
+            selection.addRange(range);
+        }
+
+        // ---------- Line-number gutter ----------
+
+        // Images always occupy a whole number of text lines so line numbers stay aligned.
         function snapImageToLines(img) {
             const lh = getLineHeight();
-            const existingHeight = parseFloat(img.style.height);
-            const existingWidth = parseFloat(img.style.width);
-            const naturalRatio = img.naturalWidth && img.naturalHeight
-                ? img.naturalWidth / img.naturalHeight
-                : null;
-
-            const baseHeight = existingHeight > 0
-                ? existingHeight
-                : (img.getBoundingClientRect().height || img.naturalHeight || img.offsetHeight);
-
+            const styledHeight = parseFloat(img.style.height);
+            const styledWidth = parseFloat(img.style.width);
+            const baseHeight = styledHeight > 0
+                ? styledHeight
+                : (img.getBoundingClientRect().height || img.naturalHeight);
             if (!(baseHeight > 0)) return;
 
-            const targetLines = Math.max(1, Math.round(baseHeight / lh));
-            const snappedHeight = targetLines * lh;
+            const snappedHeight = Math.max(1, Math.round(baseHeight / lh)) * lh;
+            if (styledHeight !== snappedHeight) img.style.height = `${snappedHeight}px`;
 
-            img.style.height = `${snappedHeight}px`;
-
-            if (!(existingWidth > 0) && naturalRatio) {
-                img.style.width = `${Math.round(snappedHeight * naturalRatio)}px`;
+            if (!(styledWidth > 0) && img.naturalWidth && img.naturalHeight) {
+                img.style.width = `${Math.round(snappedHeight * img.naturalWidth / img.naturalHeight)}px`;
             }
             img.style.objectFit = "contain";
         }
 
+        // Maps each logical line (split on "\n"/<br>/blocks) to the visual row where it
+        // starts, since wrapped lines and tall images make the two differ.
         function getLogicalLineVisualIndices() {
             const lh = getLineHeight();
-            const areaRect = area.getBoundingClientRect();
-            const style = window.getComputedStyle(area);
-            const paddingTop = parseFloat(style.paddingTop) || 12;
-            const areaTop = areaRect.top - area.scrollTop + paddingTop;
+            const paddingTop = parseFloat(getComputedStyle(area).paddingTop) || 12;
+            const areaTop = area.getBoundingClientRect().top - area.scrollTop + paddingTop;
+            const toRow = top => Math.max(0, Math.round((top - areaTop) / lh));
 
-            const indices = [];
-
-            function addIndex(topPx) {
-                const relY = topPx - areaTop;
-                const idx = Math.max(0, Math.round(relY / lh));
-                indices.push(idx);
-            }
-
-            function getCharTop(textNode, offset) {
-                const range = document.createRange();
-                const len = textNode.nodeValue.length;
-                if (len === 0) {
-                    range.selectNode(textNode);
-                } else if (offset < len) {
-                    range.setStart(textNode, offset);
-                    range.setEnd(textNode, offset + 1);
-                } else {
-                    range.setStart(textNode, offset - 1);
-                    range.setEnd(textNode, offset);
-                }
-                const rects = range.getClientRects();
-                return rects.length > 0 ? rects[0].top : range.getBoundingClientRect().top;
-            }
-
-            function getNodeTop(node) {
-                if (node.nodeType === Node.ELEMENT_NODE) {
-                    return node.getBoundingClientRect().top;
-                }
-                return getCharTop(node, 0);
-            }
-
+            const rows = [];
             let atLineStart = true;
+
+            function charTop(textNode, offset) {
+                const range = document.createRange();
+                range.setStart(textNode, offset);
+                range.setEnd(textNode, offset + 1);
+                const rects = range.getClientRects();
+                return (rects.length ? rects[0] : range.getBoundingClientRect()).top;
+            }
 
             function walk(node) {
                 if (node.nodeType === Node.TEXT_NODE) {
                     const text = node.nodeValue;
-                    for (let i = 0; i < text.length; i++) {
+                    let i = 0;
+                    while (i < text.length) {
                         if (atLineStart) {
-                            addIndex(getCharTop(node, i));
+                            rows.push(toRow(charTop(node, i)));
                             atLineStart = false;
                         }
-                        if (text[i] === '\n') {
-                            atLineStart = true;
-                        }
-                    }
-                } else if (node.nodeType === Node.ELEMENT_NODE) {
-                    const tag = node.tagName.toLowerCase();
-
-                    if (tag === "br") {
-                        if (atLineStart) {
-                            addIndex(getNodeTop(node));
-                        }
+                        const newline = text.indexOf("\n", i);
+                        if (newline === -1) break;
                         atLineStart = true;
-                    } else if (tag === "img") {
-                        const topPx = getNodeTop(node);
-                        const imgHeight = node.getBoundingClientRect().height || parseFloat(node.style.height) || lh;
-                        const lineCount = Math.max(1, Math.round(imgHeight / lh));
-                        const relY = topPx - areaTop;
-                        const baseIdx = Math.max(0, Math.round(relY / lh));
-
-                        for (let i = 0; i < lineCount; i++) {
-                            indices.push(baseIdx + i);
-                        }
-                        atLineStart = true;
-                    } else {
-                        const isBlock = window.getComputedStyle(node).display !== "inline";
-                        if (isBlock) atLineStart = true;
-
-                        for (const child of node.childNodes) {
-                            walk(child);
-                        }
-
-                        if (isBlock) atLineStart = true;
+                        i = newline + 1;
                     }
+                    return;
+                }
+                if (node.nodeType !== Node.ELEMENT_NODE) return;
+
+                const tag = node.tagName.toLowerCase();
+                if (tag === "br") {
+                    if (atLineStart) rows.push(toRow(node.getBoundingClientRect().top));
+                    atLineStart = true;
+                } else if (tag === "img") {
+                    const rect = node.getBoundingClientRect();
+                    const lineCount = Math.max(1, Math.round((rect.height || parseFloat(node.style.height) || lh) / lh));
+                    const baseRow = toRow(rect.top);
+                    for (let i = 0; i < lineCount; i++) rows.push(baseRow + i);
+                    atLineStart = true;
+                } else {
+                    const isBlock = getComputedStyle(node).display !== "inline";
+                    if (isBlock) atLineStart = true;
+                    node.childNodes.forEach(walk);
+                    if (isBlock) atLineStart = true;
                 }
             }
 
             walk(area);
-
-            if (indices.length === 0) {
-                indices.push(0);
-            }
-
-            return indices;
+            return rows.length ? rows : [0];
         }
 
         function updateGutters() {
             const lh = getLineHeight();
 
+            // Snap first so all layout writes happen before the layout reads below.
             area.querySelectorAll("img").forEach(img => {
-                if (resizeState && img === selectedImg) return;
-                snapImageToLines(img);
+                if (!(resizeState && img === selectedImg)) snapImageToLines(img);
             });
 
             const contentHeight = Math.max(lh, area.scrollHeight - 24);
-            const totalVisualLines = Math.max(1, Math.round(contentHeight / lh));
+            const totalRows = Math.max(1, Math.round(contentHeight / lh));
+            const rows = getLogicalLineVisualIndices();
+            const labels = new Array(totalRows).fill("");
 
-            const logicalIndices = getLogicalLineVisualIndices();
-            const lineNumbers = new Array(totalVisualLines).fill("");
-
-            logicalIndices.forEach((visualIndex, logicalLineNum) => {
-                if (visualIndex < totalVisualLines && !lineNumbers[visualIndex]) {
-                    lineNumbers[visualIndex] = String(logicalLineNum + 1);
-                }
+            rows.forEach((row, lineIndex) => {
+                if (row < totalRows && !labels[row]) labels[row] = String(lineIndex + 1);
             });
 
-            gutters.textContent = lineNumbers.join("\n");
-
-            const maxDigits = String(logicalIndices.length).length;
-            gutters.style.width = `${Math.max(45, maxDigits * 10 + 16)}px`;
+            gutters.textContent = labels.join("\n");
+            gutters.style.width = `${Math.max(45, String(rows.length).length * 10 + 16)}px`;
         }
 
         let guttersRaf = null;
-        const guttersObserver = new ResizeObserver(() => {
+        new ResizeObserver(() => {
             if (guttersRaf) return;
             guttersRaf = requestAnimationFrame(() => {
                 guttersRaf = null;
                 updateGutters();
             });
-        });
-        guttersObserver.observe(area);
+        }).observe(area);
 
+        // ---------- Sanitizing ----------
+
+        // Content is shared between all viewers, so only text, <br>, <div> and
+        // our own uploaded images (with size styles) are allowed through.
         function sanitizeHtml(html) {
             const template = document.createElement("template");
             template.innerHTML = html;
             sanitizeChildren(template.content);
             return template.innerHTML;
+        }
+
+        function stripAttributes(el, keep = []) {
+            for (const attr of Array.from(el.attributes)) {
+                if (!keep.includes(attr.name)) el.removeAttribute(attr.name);
+            }
         }
 
         function sanitizeChildren(node) {
@@ -404,29 +389,25 @@
 
                 const tag = child.tagName.toLowerCase();
                 if (tag === "img") {
-                    const src = child.getAttribute("src") || "";
-                    if (!/^\/pastebin-image\//.test(src)) { child.remove(); continue; }
-
-                    const w = child.style.width;
-                    const h = child.style.height;
-
-                    for (const attr of Array.from(child.attributes)) {
-                        if (attr.name !== "src" && attr.name !== "alt") child.removeAttribute(attr.name);
+                    if (!(child.getAttribute("src") || "").startsWith(IMAGE_URL_PREFIX)) {
+                        child.remove();
+                        continue;
                     }
-
+                    const { width, height } = child.style;
+                    stripAttributes(child, ["src", "alt"]);
                     child.style.cssText = "object-fit:contain;";
-                    if (w) child.style.width = w;
-                    if (h) child.style.height = h;
-                    continue;
-                }
-                if (tag === "br" || tag === "div") {
-                    for (const attr of Array.from(child.attributes)) child.removeAttribute(attr.name);
+                    if (width) child.style.width = width;
+                    if (height) child.style.height = height;
+                } else if (tag === "br" || tag === "div") {
+                    stripAttributes(child);
                     sanitizeChildren(child);
-                    continue;
+                } else {
+                    child.replaceWith(document.createTextNode(child.textContent));
                 }
-                child.replaceWith(document.createTextNode(child.textContent));
             }
         }
+
+        // ---------- WebSocket sync ----------
 
         function connect() {
             setStatus("Connecting...");
@@ -436,17 +417,14 @@
             socket.onopen = () => setStatus("");
             socket.onmessage = event => {
                 const data = JSON.parse(event.data);
+                // Never overwrite the editor while the user is typing in it.
                 if (data.type === "update" && document.activeElement !== area) {
                     deselectImage();
                     area.innerHTML = sanitizeHtml(data.text || "");
                     updateGutters();
                 }
-                if (data.type === "saved") {
-                    setStatus("Saved", 1200);
-                }
-                if (data.users !== undefined) {
-                    userCountEl.textContent = data.users;
-                }
+                if (data.type === "saved") setStatus("Saved", 1200);
+                if (data.users !== undefined) userCountEl.textContent = data.users;
             };
             socket.onclose = () => {
                 if (pageCaching) return;
@@ -456,13 +434,14 @@
             };
             socket.onerror = () => socket.close();
         }
-        connect();
 
+        // Pages restored from the back/forward cache must drop their socket and
+        // reconnect on return, otherwise they'd show stale content.
         window.addEventListener("pagehide", event => {
             if (!event.persisted) return;
             pageCaching = true;
             clearTimeout(reconnectTimer);
-            if (socket) socket.close();
+            socket?.close();
         });
 
         window.addEventListener("pageshow", event => {
@@ -471,6 +450,12 @@
             connect();
         });
 
+        function sendHtml() {
+            if (socket?.readyState !== WebSocket.OPEN) return;
+            setStatus("Saving...");
+            socket.send(JSON.stringify({ type: "update", text: sanitizeHtml(area.innerHTML) }));
+        }
+
         area.addEventListener("input", () => {
             updateGutters();
             setStatus("Syncing...");
@@ -478,66 +463,14 @@
             saveTimer = setTimeout(sendHtml, 300);
         });
 
-        function sendHtml() {
-            if (socket && socket.readyState === WebSocket.OPEN) {
-                setStatus("Saving...");
-                socket.send(JSON.stringify({ type: "update", text: sanitizeHtml(area.innerHTML) }));
-            }
-        }
+        // ---------- Image resizing ----------
 
-        copyBtn.addEventListener("click", () => {
-            navigator.clipboard.writeText(area.textContent);
-            setStatus("Copied to clipboard", 1200);
-        });
-
-        uploadBtn.addEventListener("click", () => {
-            fileInput.click();
-        });
-
-        fileInput.addEventListener("change", () => {
-            const file = fileInput.files[0];
-            if (file && isImageFile(file)) {
-                uploadImage(file, getEditableRange());
-            }
-            fileInput.value = "";
-        });
-
-        function getEditableRange() {
-            const selection = window.getSelection();
-            if (selection && selection.rangeCount > 0) {
-                const range = selection.getRangeAt(0);
-                if (area.contains(range.commonAncestorContainer)) return range.cloneRange();
-            }
-            if (lastRange) {
-                return lastRange.cloneRange();
-            }
-            const range = document.createRange();
-            range.selectNodeContents(area);
-            range.collapse(false);
-            return range;
-        }
-
-        function insertNodeAtRange(node, range) {
-            range.deleteContents();
-            range.insertNode(node);
-            range.setStartAfter(node);
-            range.collapse(true);
-            const selection = window.getSelection();
-            selection.removeAllRanges();
-            selection.addRange(range);
-        }
-
-        function insertImageAtRange(url, range) {
-            const img = document.createElement("img");
-            img.src = url;
-            img.alt = "pasted image";
-            img.onload = () => {
-                snapImageToLines(img);
-                updateGutters();
-                area.dispatchEvent(new Event("input"));
-            };
-            insertNodeAtRange(img, range);
-        }
+        const handles = [
+            createHandle("corner", "both"),
+            createHandle("edge-right", "width"),
+            createHandle("edge-bottom", "height"),
+        ];
+        const [cornerHandle, rightHandle, bottomHandle] = handles;
 
         function createHandle(className, mode) {
             const handle = document.createElement("div");
@@ -551,50 +484,51 @@
             if (!selectedImg) return;
             const rect = selectedImg.getBoundingClientRect();
 
-            handles.corner.style.left = `${rect.right - 6}px`;
-            handles.corner.style.top = `${rect.bottom - 6}px`;
-
-            handles.right.style.left = `${rect.right - 4}px`;
-            handles.right.style.top = `${rect.top + rect.height / 2 - 14}px`;
-
-            handles.bottom.style.left = `${rect.left + rect.width / 2 - 14}px`;
-            handles.bottom.style.top = `${rect.bottom - 4}px`;
+            cornerHandle.style.left = `${rect.right - 6}px`;
+            cornerHandle.style.top = `${rect.bottom - 6}px`;
+            rightHandle.style.left = `${rect.right - 4}px`;
+            rightHandle.style.top = `${rect.top + rect.height / 2 - 14}px`;
+            bottomHandle.style.left = `${rect.left + rect.width / 2 - 14}px`;
+            bottomHandle.style.top = `${rect.bottom - 4}px`;
         }
 
         function selectImage(img) {
             if (selectedImg === img) return;
             deselectImage();
             selectedImg = img;
-            selectedImg.classList.add("img-selected");
+            img.classList.add("img-selected");
             positionHandles();
-            Object.values(handles).forEach(h => h.style.display = "block");
+            handles.forEach(h => { h.style.display = "block"; });
         }
 
         function deselectImage() {
             if (!selectedImg) return;
             selectedImg.classList.remove("img-selected");
             selectedImg = null;
-            Object.values(handles).forEach(h => h.style.display = "none");
+            handles.forEach(h => { h.style.display = "none"; });
         }
 
         function startResize(event, mode, handle) {
             if (!selectedImg) return;
             event.preventDefault();
             event.stopPropagation();
+
+            const rect = selectedImg.getBoundingClientRect();
             resizeState = {
                 mode,
                 startX: event.clientX,
                 startY: event.clientY,
-                startWidth: selectedImg.getBoundingClientRect().width,
-                startHeight: selectedImg.getBoundingClientRect().height,
+                startWidth: rect.width,
+                startHeight: rect.height,
                 aspectRatio: selectedImg.naturalWidth / selectedImg.naturalHeight || 1,
-                charWidth: getCharWidth()
+                charWidth: getCharWidth(),
             };
             handle.setPointerCapture(event.pointerId);
             handle.addEventListener("pointermove", onResizeMove);
             handle.addEventListener("pointerup", endResize);
         }
 
+        // Height snaps to whole lines; width-only resizing snaps to whole characters.
         function onResizeMove(event) {
             if (!resizeState || !selectedImg) return;
             const lh = getLineHeight();
@@ -603,20 +537,15 @@
             let newHeight = startHeight;
             let newWidth = startWidth;
 
-            if (mode === "height" || mode === "both") {
-                const deltaY = event.clientY - startY;
-                const lineCount = Math.max(1, Math.round((startHeight + deltaY) / lh));
-                newHeight = lineCount * lh;
+            if (mode !== "width") {
+                const lines = Math.max(1, Math.round((startHeight + event.clientY - startY) / lh));
+                newHeight = lines * lh;
             }
-
-            if (mode === "width" || mode === "both") {
-                const deltaX = event.clientX - startX;
-                if (mode === "width") {
-                    const charCount = Math.max(1, Math.round((startWidth + deltaX) / charWidth));
-                    newWidth = charCount * charWidth;
-                } else {
-                    newWidth = Math.round(newHeight * aspectRatio);
-                }
+            if (mode === "width") {
+                const chars = Math.max(1, Math.round((startWidth + event.clientX - startX) / charWidth));
+                newWidth = chars * charWidth;
+            } else if (mode === "both") {
+                newWidth = Math.round(newHeight * aspectRatio);
             }
 
             selectedImg.style.height = `${Math.max(lh, newHeight)}px`;
@@ -633,15 +562,14 @@
             handle.removeEventListener("pointermove", onResizeMove);
             handle.removeEventListener("pointerup", endResize);
             resizeState = null;
-            updateGutters();
-            area.dispatchEvent(new Event("input"));
+            notifyChange();
         }
 
         document.addEventListener("click", event => {
             const target = event.target;
             if (target.tagName === "IMG" && area.contains(target)) {
                 selectImage(target);
-            } else if (!Object.values(handles).includes(target)) {
+            } else if (!handles.includes(target)) {
                 deselectImage();
             }
         });
@@ -652,10 +580,17 @@
         });
         window.addEventListener("resize", positionHandles);
 
-        const IMAGE_EXTENSION_RE = /\.(png|jpe?g|gif|webp|bmp|avif|svg|heic|heif)$/i;
+        // ---------- Image upload / paste / drop ----------
 
-        function isImageFile(file) {
-            return file && (file.type?.startsWith("image/") || IMAGE_EXTENSION_RE.test(file.name || ""));
+        function insertImageAtRange(url, range) {
+            const img = document.createElement("img");
+            img.src = url;
+            img.alt = "pasted image";
+            img.onload = () => {
+                snapImageToLines(img);
+                notifyChange();
+            };
+            insertNodeAtRange(img, range);
         }
 
         async function uploadImage(file, range) {
@@ -673,24 +608,46 @@
             }
         }
 
+        function rangeFromPoint(x, y) {
+            if (document.caretRangeFromPoint) return document.caretRangeFromPoint(x, y);
+            const pos = document.caretPositionFromPoint?.(x, y);
+            if (!pos) return null;
+            const range = document.createRange();
+            range.setStart(pos.offsetNode, pos.offset);
+            range.collapse(true);
+            return range;
+        }
+
+        $("copy-btn").addEventListener("click", () => {
+            navigator.clipboard.writeText(area.textContent);
+            setStatus("Copied to clipboard", 1200);
+        });
+
+        $("upload-btn").addEventListener("click", () => fileInput.click());
+
+        fileInput.addEventListener("change", () => {
+            const file = fileInput.files[0];
+            if (isImageFile(file)) uploadImage(file, getEditableRange());
+            fileInput.value = "";
+        });
+
+        // Paste as plain text so foreign formatting never enters the shared document.
         area.addEventListener("paste", event => {
-            const items = event.clipboardData ? event.clipboardData.items : [];
-            for (const item of items) {
-                if (item.kind === "file") {
-                    const file = item.getAsFile();
-                    if (isImageFile(file)) {
-                        event.preventDefault();
-                        uploadImage(file, getEditableRange());
-                        return;
-                    }
+            const clipboard = event.clipboardData;
+            for (const item of clipboard?.items ?? []) {
+                if (item.kind !== "file") continue;
+                const file = item.getAsFile();
+                if (isImageFile(file)) {
+                    event.preventDefault();
+                    uploadImage(file, getEditableRange());
+                    return;
                 }
             }
-            const text = event.clipboardData?.getData("text/plain");
+            const text = clipboard?.getData("text/plain");
             if (text) {
                 event.preventDefault();
                 insertNodeAtRange(document.createTextNode(text), getEditableRange());
-                updateGutters();
-                area.dispatchEvent(new Event("input"));
+                notifyChange();
             }
         });
 
@@ -704,23 +661,10 @@
 
         area.addEventListener("dragleave", () => area.classList.remove("drag-over"));
 
-        function rangeFromPoint(x, y) {
-            if (document.caretRangeFromPoint) return document.caretRangeFromPoint(x, y);
-            if (document.caretPositionFromPoint) {
-                const pos = document.caretPositionFromPoint(x, y);
-                if (!pos) return null;
-                const range = document.createRange();
-                range.setStart(pos.offsetNode, pos.offset);
-                range.collapse(true);
-                return range;
-            }
-            return null;
-        }
-
         area.addEventListener("drop", event => {
             event.preventDefault();
             area.classList.remove("drag-over");
-            const files = event.dataTransfer ? Array.from(event.dataTransfer.files) : [];
+            const files = Array.from(event.dataTransfer?.files ?? []);
             const images = files.filter(isImageFile);
 
             if (images.length) {
@@ -731,6 +675,7 @@
             }
         });
 
+        connect();
         updateGutters();
     </script>
 </body>

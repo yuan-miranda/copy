@@ -1,41 +1,28 @@
 import json
 import logging
 import os
+import threading
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
-import threading
 
-from flask import (
-    Flask,
-    Response,
-    abort,
-    jsonify,
-    render_template,
-    request,
-    send_from_directory,
-)
+from flask import Flask, jsonify, render_template, request, send_from_directory
 from flask_sock import Sock
 from werkzeug.utils import secure_filename
 
-# --- Logging Setup ---
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("pastebin.server")
 
-# --- App Initialization ---
 app = Flask(__name__)
 sock = Sock(app)
 
-# --- Configuration & Paths ---
-MANILA_TIMEZONE = ZoneInfo("Asia/Manila")
-PASTE_PATH = Path(__file__).resolve().with_name("pastebin.txt")
-PASTE_IMAGES_DIR = Path(__file__).resolve().parent / "pastebin_images"
-PASTE_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+MANILA_TZ = ZoneInfo("Asia/Manila")
+BASE_DIR = Path(__file__).resolve().parent
+PASTE_PATH = BASE_DIR / "pastebin.txt"
+IMAGES_DIR = BASE_DIR / "pastebin_images"
+IMAGES_DIR.mkdir(exist_ok=True)
 
-ALLOWED_IMAGE_TYPES = {
+IMAGE_TYPES = {
     "image/png": ".png",
     "image/jpeg": ".jpg",
     "image/gif": ".gif",
@@ -47,53 +34,71 @@ ALLOWED_IMAGE_TYPES = {
     "image/heic": ".heic",
     "image/heif": ".heif",
 }
-ALLOWED_IMAGE_EXTENSIONS = {
-    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".avif", ".svg", ".heic", ".heif",
-}
+IMAGE_EXTENSIONS = set(IMAGE_TYPES.values()) | {".jpeg"}
 
-# --- State Management ---
+# state_lock guards paste_text and the file write, so memory and disk never diverge.
 paste_text = ""
-paste_lock = threading.Lock()
-paste_clients = set()
-paste_clients_lock = threading.Lock()
-send_lock = threading.Lock()
+state_lock = threading.Lock()
+
+# Each socket gets its own send lock: a websocket must not be written to from
+# two threads at once, but one slow client shouldn't block sends to the others.
+clients = {}
+clients_lock = threading.Lock()
+
+
+def save_paste(text):
+    # Write to a temp file and rename so a crash mid-write can't corrupt the paste.
+    tmp = PASTE_PATH.with_suffix(".tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(PASTE_PATH)
+    except OSError as error:
+        logger.warning("Could not save %s: %s", PASTE_PATH.name, error)
 
 
 def load_saved_paste():
     global paste_text
-    if PASTE_PATH.is_file():
-        try:
-            paste_text = PASTE_PATH.read_text(encoding="utf-8")
-        except OSError as error:
-            logger.warning("Could not load pastebin.txt: %s", error)
+    try:
+        paste_text = PASTE_PATH.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        logger.warning("Could not load %s: %s", PASTE_PATH.name, error)
+
+
+def safe_send(ws, lock, payload):
+    try:
+        with lock:
+            ws.send(payload)
+        return True
+    except Exception:
+        return False
 
 
 def broadcast_state(exclude=None):
-    """Broadcasts paste text and active user count to all connected clients."""
-    with paste_clients_lock:
-        user_count = len(paste_clients)
-        sockets = list(paste_clients)
-        
-    payload = json.dumps({"type": "update", "text": paste_text, "users": user_count})
-    for websocket in sockets:
-        if websocket is exclude:
-            continue
-        try:
-            with send_lock:
-                websocket.send(payload)
-        except Exception:
-            with paste_clients_lock:
-                paste_clients.discard(websocket)
+    """Send the current text and user count to every client except `exclude`."""
+    with clients_lock:
+        targets = list(clients.items())
+    with state_lock:
+        text = paste_text
+
+    payload = json.dumps({"type": "update", "text": text, "users": len(targets)})
+    dead = [
+        ws for ws, lock in targets
+        if ws is not exclude and not safe_send(ws, lock, payload)
+    ]
+    if dead:
+        with clients_lock:
+            for ws in dead:
+                clients.pop(ws, None)
 
 
 load_saved_paste()
 
 
-# --- Flask Routes ---
-
 @app.get("/")
 def pastebin_page():
-    return render_template("index.html", paste_text=paste_text)
+    return render_template("index.html")
 
 
 @app.post("/pastebin-image")
@@ -102,77 +107,56 @@ def pastebin_image_upload():
     if image is None or not image.filename:
         return jsonify(error="Missing image file"), 400
 
-    content_type = (image.mimetype or "").lower()
-    extension = ALLOWED_IMAGE_TYPES.get(content_type)
+    extension = IMAGE_TYPES.get((image.mimetype or "").lower())
     if not extension:
         guessed = Path(secure_filename(image.filename)).suffix.lower()
-        if guessed in ALLOWED_IMAGE_EXTENSIONS:
-            extension = ".jpg" if guessed == ".jpeg" else guessed
-        else:
+        if guessed not in IMAGE_EXTENSIONS:
             return jsonify(error="Unsupported image type"), 400
+        extension = ".jpg" if guessed == ".jpeg" else guessed
 
-    timestamp = datetime.now(MANILA_TIMEZONE).strftime("%Y%m%d_%H%M%S_%f")
+    timestamp = datetime.now(MANILA_TZ).strftime("%Y%m%d_%H%M%S_%f")
     filename = f"paste_{timestamp}{extension}"
-    image.save(PASTE_IMAGES_DIR / filename)
+    image.save(IMAGES_DIR / filename)
     logger.info("Pastebin image uploaded: file=%s", filename)
     return jsonify(url=f"/pastebin-image/{filename}"), 201
 
 
-@app.get("/pastebin-image/<path:filename>")
+@app.get("/pastebin-image/<filename>")
 def pastebin_image_view(filename):
-    safe_filename = Path(filename)
-    if safe_filename.name != filename:
-        abort(404)
-
-    image_path = PASTE_IMAGES_DIR / safe_filename.name
-    if not image_path.is_file():
-        abort(404)
-
-    return send_from_directory(PASTE_IMAGES_DIR, safe_filename.name)
+    # send_from_directory rejects path traversal and 404s on missing files.
+    return send_from_directory(IMAGES_DIR, filename)
 
 
 @sock.route("/pastebin-ws")
 def pastebin_websocket(ws):
     global paste_text
-    with paste_clients_lock:
-        paste_clients.add(ws)
-    
-    # Broadcast new user count on connect
+    send_lock = threading.Lock()
+    with clients_lock:
+        clients[ws] = send_lock
+
+    # Also delivers the current state to the newly connected client.
     broadcast_state()
 
     try:
-        with send_lock:
-            with paste_clients_lock:
-                count = len(paste_clients)
-            ws.send(json.dumps({"type": "update", "text": paste_text, "users": count}))
-            
-        while True:
-            raw = ws.receive()
-            if raw is None:
-                break
+        while (raw := ws.receive()) is not None:
             try:
                 data = json.loads(raw)
-            except (TypeError, json.JSONDecodeError):
+            except (TypeError, ValueError):
                 continue
-            if data.get("type") == "update":
-                text = str(data.get("text", ""))
-                with paste_lock:
-                    paste_text = text
-                    try:
-                        PASTE_PATH.write_text(text, encoding="utf-8")
-                    except OSError as error:
-                        logger.warning("Could not save pastebin.txt: %s", error)
-                broadcast_state(exclude=ws)
-                try:
-                    with send_lock:
-                        ws.send(json.dumps({"type": "saved"}))
-                except Exception:
-                    pass
+            if not isinstance(data, dict) or data.get("type") != "update":
+                continue
+
+            text = str(data.get("text", ""))
+            with state_lock:
+                paste_text = text
+                save_paste(text)
+            broadcast_state(exclude=ws)
+            safe_send(ws, send_lock, '{"type": "saved"}')
     except Exception:
         pass
     finally:
-        with paste_clients_lock:
-            paste_clients.discard(ws)
+        with clients_lock:
+            clients.pop(ws, None)
         broadcast_state()
 
 
