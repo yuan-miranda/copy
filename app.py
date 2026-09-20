@@ -10,7 +10,9 @@ from flask import Flask, jsonify, render_template, request, send_from_directory
 from flask_sock import Sock
 from werkzeug.utils import secure_filename
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s"
+)
 logger = logging.getLogger("pastebin.server")
 
 app = Flask(__name__)
@@ -84,7 +86,8 @@ def broadcast_state(exclude=None):
 
     payload = json.dumps({"type": "update", "text": text, "users": len(targets)})
     dead = [
-        ws for ws, lock in targets
+        ws
+        for ws, lock in targets
         if ws is not exclude and not safe_send(ws, lock, payload)
     ]
     if dead:
