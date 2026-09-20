@@ -343,17 +343,30 @@
                 if (!(resizeState && img === selectedImg)) snapImageToLines(img);
             });
 
-            const contentHeight = Math.max(lh, area.scrollHeight - 24);
-            const totalRows = Math.max(1, Math.round(contentHeight / lh));
             const rows = getLogicalLineVisualIndices();
-            const labels = new Array(totalRows).fill("");
 
+            // Number only rows that actually contain content.
+            const contentRange = document.createRange();
+            contentRange.selectNodeContents(area);
+            const areaTop = area.getBoundingClientRect().top - area.scrollTop
+                + (parseFloat(getComputedStyle(area).paddingTop) || 12);
+            const contentRows = Math.max(1, Math.round((contentRange.getBoundingClientRect().bottom - areaTop) / lh));
+
+            const labels = new Array(contentRows).fill("");
             rows.forEach((row, lineIndex) => {
-                if (row < totalRows && !labels[row]) labels[row] = String(lineIndex + 1);
+                if (row < contentRows && !labels[row]) labels[row] = String(lineIndex + 1);
             });
 
             gutters.textContent = labels.join("\n");
             gutters.style.width = `${Math.max(45, String(rows.length).length * 10 + 16)}px`;
+
+            // The gutter must be exactly as tall as the editor's scrollable area (which has extra
+            // bottom padding), otherwise it can't scroll as far and its numbers drift down by
+            // a row once the editor gets a scrollbar. Then re-sync the scroll position.
+            gutters.style.paddingBottom = "";
+            const shortfall = area.scrollHeight - gutters.scrollHeight;
+            if (shortfall > 0) gutters.style.paddingBottom = `${12 + shortfall}px`;
+            gutters.scrollTop = area.scrollTop;
         }
 
         let guttersRaf = null;
@@ -591,6 +604,15 @@
                 notifyChange();
             };
             insertNodeAtRange(img, range);
+
+            // The image is a block, so it already ends its line. Drop the line break
+            // that used to end that line, or it renders as an empty row under the image.
+            const next = img.nextSibling;
+            if (next?.nodeName === "BR") {
+                next.remove();
+            } else if (next?.nodeType === Node.TEXT_NODE && next.nodeValue.startsWith("\n")) {
+                next.nodeValue = next.nodeValue.slice(1);
+            }
         }
 
         async function uploadImage(file, range) {
