@@ -645,9 +645,29 @@
             return range;
         }
 
-        $("copy-btn").addEventListener("click", () => {
-            navigator.clipboard.writeText(area.textContent);
-            setStatus("Copied to clipboard", 1200);
+        // navigator.clipboard only exists on HTTPS or localhost; over plain http (e.g. a LAN IP)
+        // it is undefined, so fall back to the legacy execCommand copy.
+        async function copyText(text) {
+            if (navigator.clipboard?.writeText) {
+                try {
+                    await navigator.clipboard.writeText(text);
+                    return true;
+                } catch { /* fall through to the legacy path */ }
+            }
+            const temp = document.createElement("textarea");
+            temp.value = text;
+            temp.style.cssText = "position:fixed;top:0;left:0;opacity:0;";
+            document.body.appendChild(temp);
+            temp.select();
+            let ok = false;
+            try { ok = document.execCommand("copy"); } catch { /* ignored */ }
+            temp.remove();
+            return ok;
+        }
+
+        $("copy-btn").addEventListener("click", async () => {
+            const ok = await copyText(area.textContent);
+            setStatus(ok ? "Copied to clipboard" : "Copy failed", 1200);
         });
 
         $("upload-btn").addEventListener("click", () => fileInput.click());
