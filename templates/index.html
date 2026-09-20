@@ -666,7 +666,7 @@
         }
 
         $("copy-btn").addEventListener("click", async () => {
-            const ok = await copyText(area.textContent);
+            const ok = await copyText(area.innerText);
             setStatus(ok ? "Copied to clipboard" : "Copy failed", 1200);
         });
 
