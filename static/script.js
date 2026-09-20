@@ -63,7 +63,12 @@ function currentAreaRange() {
 
 document.addEventListener("selectionchange", () => {
     const range = currentAreaRange();
-    if (range) lastRange = range.cloneRange();
+    if (range) {
+        lastRange = range.cloneRange();
+        if (selectedImg && range.collapsed) {
+            deselectImage();
+        }
+    }
 });
 
 function getEditableRange() {
@@ -301,6 +306,9 @@ function sendHtml() {
 }
 
 area.addEventListener("input", () => {
+    if (selectedImg && !area.contains(selectedImg)) {
+        deselectImage();
+    }
     updateGutters();
     setStatus("Syncing...");
     clearTimeout(saveTimer);
@@ -343,6 +351,14 @@ function selectImage(img) {
     img.classList.add("img-selected");
     positionHandles();
     handles.forEach(h => { h.style.display = "block"; });
+
+    const selection = getSelection();
+    if (selection) {
+        const range = document.createRange();
+        range.selectNode(img);
+        selection.removeAllRanges();
+        selection.addRange(range);
+    }
 }
 
 function deselectImage() {
