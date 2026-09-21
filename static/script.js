@@ -269,6 +269,51 @@ const cursorEls = new Map();
 let cursorTimer = null;
 let cursorsRaf = null;
 let lastSentPos;
+let lastContent = "";
+let typingUntil = 0;
+let freezeTimer = null;
+
+// One character per position unit, matching pointToOffset/offsetToPoint.
+function serializeContent() {
+    let out = "";
+    (function walk(node) {
+        if (node.nodeType === Node.TEXT_NODE) { out += node.nodeValue; return; }
+        if (node.nodeType !== Node.ELEMENT_NODE) return;
+        if (node.tagName === "BR") { out += "\u0001"; return; }
+        if (node.tagName === "IMG") { out += "\u0002"; return; }
+        if (isBlock(node)) out += "\u0003";
+        node.childNodes.forEach(walk);
+    })(area);
+    return out;
+}
+
+// Returns a function mapping offsets in `oldStr` to the matching offsets in `newStr`.
+function diffShift(oldStr, newStr) {
+    const limit = Math.min(oldStr.length, newStr.length);
+    let prefix = 0;
+    while (prefix < limit && oldStr[prefix] === newStr[prefix]) prefix++;
+    let suffix = 0;
+    while (
+        suffix < limit - prefix
+        && oldStr[oldStr.length - 1 - suffix] === newStr[newStr.length - 1 - suffix]
+    ) suffix++;
+    const oldEnd = oldStr.length - suffix;
+    const newEnd = newStr.length - suffix;
+    return offset => {
+        if (offset <= prefix) return offset;
+        if (offset >= oldEnd) return offset + (newEnd - oldEnd);
+        return prefix + Math.min(offset - prefix, newEnd - prefix);
+    };
+}
+
+// After a local edit, keep other users' cursors attached to their text.
+function anchorRemoteCursors() {
+    const now = serializeContent();
+    if (now === lastContent) return;
+    const shift = diffShift(lastContent, now);
+    remoteCursors = remoteCursors.map(cursor => ({ ...cursor, pos: shift(cursor.pos) }));
+    lastContent = now;
+}
 
 function isBlock(node) {
     return node.tagName === "DIV" && node !== area;
@@ -462,10 +507,18 @@ function drawCursors() {
 }
 
 function renderCursors() {
+    // Hold other users' cursors still while typing, then let them settle.
+    const wait = typingUntil - Date.now();
+    if (wait > 0) {
+        clearTimeout(freezeTimer);
+        freezeTimer = setTimeout(renderCursors, wait + 20);
+        return;
+    }
     if (cursorsRaf) return;
     cursorsRaf = requestAnimationFrame(() => {
         cursorsRaf = null;
-        drawCursors();
+        if (typingUntil > Date.now()) renderCursors();
+        else drawCursors();
     });
 }
 
@@ -495,44 +548,48 @@ let pendingTimer = null;
 let dirty = false;
 let lastEditAt = 0;
 
-function saveCaret() {
+function saveSelection() {
     const selection = getSelection();
     if (!selection?.rangeCount || !area.contains(selection.anchorNode)) return null;
     const range = selection.getRangeAt(0);
-    const before = document.createRange();
-    before.selectNodeContents(area);
-    before.setEnd(range.startContainer, range.startOffset);
-    return before.toString().length;
+    return {
+        start: pointToOffset(range.startContainer, range.startOffset),
+        end: pointToOffset(range.endContainer, range.endOffset),
+    };
 }
 
-function restoreCaret(offset) {
-    const walker = document.createTreeWalker(area, NodeFilter.SHOW_TEXT);
+function restoreSelection({ start, end }) {
+    const from = offsetToPoint(start);
+    const to = start === end ? from : offsetToPoint(end);
     const range = document.createRange();
-    let remaining = offset;
-    let node;
-    let placed = false;
-    while ((node = walker.nextNode())) {
-        if (remaining <= node.nodeValue.length) {
-            range.setStart(node, remaining);
-            placed = true;
-            break;
-        }
-        remaining -= node.nodeValue.length;
-    }
-    if (!placed) range.selectNodeContents(area);
-    range.collapse(placed);
+    range.setStart(from.node, from.offset);
+    range.setEnd(to.node, to.offset);
     const selection = getSelection();
     selection.removeAllRanges();
     selection.addRange(range);
 }
 
+// Replaces the editor content with a remote version while keeping the local
+// caret attached to the same text: edits made before the caret shift it,
+// edits after it leave it alone.
 function applyRemote(text) {
     const html = sanitizeHtml(text || "");
     if (html === sanitizeHtml(area.innerHTML)) return;
-    const caret = document.activeElement === area ? saveCaret() : null;
+
+    const selection = document.activeElement === area ? saveSelection() : null;
+    const before = serializeContent();
+    const scroll = area.scrollTop;
+
     deselectImage();
     area.innerHTML = html;
-    if (caret !== null) restoreCaret(caret);
+
+    const after = serializeContent();
+    if (selection) {
+        const shift = diffShift(before, after);
+        restoreSelection({ start: shift(selection.start), end: shift(selection.end) });
+    }
+    lastContent = after;
+    area.scrollTop = scroll;
     updateGutters();
 }
 
@@ -667,6 +724,8 @@ area.addEventListener("input", () => {
     updateGutters();
     dirty = true;
     lastEditAt = Date.now();
+    typingUntil = Date.now() + 600;
+    anchorRemoteCursors();
     setStatus("Syncing...");
     clearTimeout(saveTimer);
     saveTimer = setTimeout(sendHtml, 300);
