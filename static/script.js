@@ -258,31 +258,141 @@ function sanitizeChildren(node) {
 
 // ---------- WebSocket sync ----------
 
+let pendingRemote = null;
+let pendingTimer = null;
+let dirty = false;
+let lastEditAt = 0;
+
+function saveCaret() {
+    const selection = getSelection();
+    if (!selection?.rangeCount || !area.contains(selection.anchorNode)) return null;
+    const range = selection.getRangeAt(0);
+    const before = document.createRange();
+    before.selectNodeContents(area);
+    before.setEnd(range.startContainer, range.startOffset);
+    return before.toString().length;
+}
+
+function restoreCaret(offset) {
+    const walker = document.createTreeWalker(area, NodeFilter.SHOW_TEXT);
+    const range = document.createRange();
+    let remaining = offset;
+    let node;
+    let placed = false;
+    while ((node = walker.nextNode())) {
+        if (remaining <= node.nodeValue.length) {
+            range.setStart(node, remaining);
+            placed = true;
+            break;
+        }
+        remaining -= node.nodeValue.length;
+    }
+    if (!placed) range.selectNodeContents(area);
+    range.collapse(placed);
+    const selection = getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+}
+
+function applyRemote(text) {
+    const html = sanitizeHtml(text || "");
+    if (html === sanitizeHtml(area.innerHTML)) return;
+    const caret = document.activeElement === area ? saveCaret() : null;
+    deselectImage();
+    area.innerHTML = html;
+    if (caret !== null) restoreCaret(caret);
+    updateGutters();
+}
+
+// Only hold back remote changes while the user is actively editing here.
+// Anything held back is applied once they go idle or leave the editor,
+// instead of being dropped (which used to require a page reload).
+function isActivelyEditing() {
+    if (resizeState) return true;
+    if (document.activeElement !== area || !document.hasFocus()) return false;
+    return dirty || Date.now() - lastEditAt < 1500;
+}
+
+function flushRemote() {
+    clearTimeout(pendingTimer);
+    if (pendingRemote === null) return;
+    if (isActivelyEditing()) {
+        pendingTimer = setTimeout(flushRemote, 700);
+        return;
+    }
+    const text = pendingRemote;
+    pendingRemote = null;
+    applyRemote(text);
+}
+
+area.addEventListener("blur", flushRemote);
+
 function connect() {
+    clearTimeout(reconnectTimer);
+    if (socket && socket.readyState <= WebSocket.OPEN) {
+        socket.onclose = null;
+        socket.close();
+    }
     setStatus("Connecting...");
     const protocol = location.protocol === "https:" ? "wss://" : "ws://";
-    socket = new WebSocket(`${protocol}${location.host}/pastebin-ws`);
+    const ws = new WebSocket(`${protocol}${location.host}/pastebin-ws`);
+    socket = ws;
 
-    socket.onopen = () => setStatus("");
-    socket.onmessage = event => {
+    ws.onopen = () => {
+        setStatus("");
+        if (dirty) sendHtml(); // push edits made while we were offline
+    };
+    ws.onmessage = event => {
         const data = JSON.parse(event.data);
-        // Never overwrite the editor while the user is typing in it.
-        if (data.type === "update" && document.activeElement !== area) {
-            deselectImage();
-            area.innerHTML = sanitizeHtml(data.text || "");
-            updateGutters();
+        if (data.type === "update") {
+            pendingRemote = data.text || "";
+            flushRemote();
         }
         if (data.type === "saved") setStatus("Saved", 1200);
         if (data.users !== undefined) userCountEl.textContent = data.users;
     };
-    socket.onclose = () => {
-        if (pageCaching) return;
+    ws.onclose = () => {
+        if (pageCaching || ws !== socket) return;
         setStatus("Offline, reconnecting...");
         clearTimeout(reconnectTimer);
         reconnectTimer = setTimeout(connect, 2000);
     };
-    socket.onerror = () => socket.close();
+    ws.onerror = () => ws.close();
 }
+
+// The socket only lives while the page is in use: connect when the page gets
+// focus (which also fetches the latest text) and disconnect when it loses it.
+function isConnected() {
+    return socket && socket.readyState <= WebSocket.OPEN;
+}
+
+function goOnline() {
+    if (pageCaching || isConnected()) return;
+    connect();
+}
+
+function goOffline() {
+    // Push any unsent edit first, then drop the connection.
+    if (dirty) {
+        clearTimeout(saveTimer);
+        sendHtml();
+    }
+    clearTimeout(reconnectTimer);
+    clearTimeout(pendingTimer);
+    if (socket) {
+        socket.onclose = null;
+        socket.close();
+        socket = null;
+    }
+    setStatus("");
+}
+
+window.addEventListener("focus", goOnline);
+window.addEventListener("blur", goOffline);
+document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") goOnline();
+    else goOffline();
+});
 
 // Pages restored from the back/forward cache must drop their socket and
 // reconnect on return, otherwise they'd show stale content.
@@ -302,6 +412,8 @@ window.addEventListener("pageshow", event => {
 function sendHtml() {
     if (socket?.readyState !== WebSocket.OPEN) return;
     setStatus("Saving...");
+    dirty = false;
+    pendingRemote = null; // our version is being sent and supersedes it
     socket.send(JSON.stringify({ type: "update", text: sanitizeHtml(area.innerHTML) }));
 }
 
@@ -310,6 +422,8 @@ area.addEventListener("input", () => {
         deselectImage();
     }
     updateGutters();
+    dirty = true;
+    lastEditAt = Date.now();
     setStatus("Syncing...");
     clearTimeout(saveTimer);
     saveTimer = setTimeout(sendHtml, 300);
