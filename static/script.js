@@ -69,6 +69,7 @@ document.addEventListener("selectionchange", () => {
             deselectImage();
         }
     }
+    scheduleCursor();
 });
 
 function getEditableRange() {
@@ -203,6 +204,7 @@ function updateGutters() {
     const shortfall = area.scrollHeight - gutters.scrollHeight;
     if (shortfall > 0) gutters.style.paddingBottom = `${12 + shortfall}px`;
     gutters.scrollTop = area.scrollTop;
+    renderCursors();
 }
 
 let guttersRaf = null;
@@ -255,6 +257,175 @@ function sanitizeChildren(node) {
         }
     }
 }
+
+// ---------- Remote cursors ----------
+
+// A caret is described as an offset in a walk over the document where text
+// counts by character and <br>/<img> count as 1, so every device (which holds
+// the same synced content) resolves the same offset to the same place.
+let myId = null;
+let remoteCursors = [];
+const cursorEls = new Map();
+let cursorTimer = null;
+let cursorsRaf = null;
+let lastSentPos;
+
+function unitsOf(node) {
+    if (node.nodeType === Node.TEXT_NODE) return node.nodeValue.length;
+    if (node.nodeType !== Node.ELEMENT_NODE) return 0;
+    if (node.tagName === "BR" || node.tagName === "IMG") return 1;
+    let total = 0;
+    node.childNodes.forEach(child => { total += unitsOf(child); });
+    return total;
+}
+
+function pointToOffset(target, targetOffset) {
+    let count = 0;
+    let found = false;
+    function walk(node) {
+        if (found) return;
+        if (node === target) {
+            if (node.nodeType === Node.TEXT_NODE) {
+                count += targetOffset;
+            } else {
+                for (let i = 0; i < targetOffset && i < node.childNodes.length; i++) {
+                    count += unitsOf(node.childNodes[i]);
+                }
+            }
+            found = true;
+            return;
+        }
+        if (node.nodeType === Node.TEXT_NODE) { count += node.nodeValue.length; return; }
+        if (node.nodeType !== Node.ELEMENT_NODE) return;
+        if (node.tagName === "BR" || node.tagName === "IMG") { count += 1; return; }
+        node.childNodes.forEach(walk);
+    }
+    walk(area);
+    return count;
+}
+
+function offsetToPoint(offset) {
+    let remaining = offset;
+    let result = null;
+    function walk(node) {
+        if (result) return;
+        if (node.nodeType === Node.TEXT_NODE) {
+            if (remaining <= node.nodeValue.length) result = { node, offset: remaining };
+            else remaining -= node.nodeValue.length;
+            return;
+        }
+        if (node.nodeType !== Node.ELEMENT_NODE) return;
+        if (node.tagName === "BR" || node.tagName === "IMG") {
+            if (remaining === 0) {
+                result = { node: node.parentNode, offset: Array.prototype.indexOf.call(node.parentNode.childNodes, node) };
+            } else {
+                remaining -= 1;
+            }
+            return;
+        }
+        node.childNodes.forEach(walk);
+    }
+    walk(area);
+    return result || { node: area, offset: area.childNodes.length };
+}
+
+function textRect(node, start, end) {
+    const range = document.createRange();
+    range.setStart(node, start);
+    range.setEnd(node, end);
+    const rects = range.getClientRects();
+    const rect = rects.length ? rects[0] : range.getBoundingClientRect();
+    return rect.height > 0 ? rect : null;
+}
+
+// Screen position { x, y, h } of a DOM point, or null if it can't be measured.
+function pointToScreen(node, offset) {
+    const lh = getLineHeight();
+    if (node.nodeType === Node.TEXT_NODE) {
+        const len = node.nodeValue.length;
+        if (offset < len) {
+            const rect = textRect(node, offset, offset + 1);
+            if (rect) return { x: rect.left, y: rect.top + rect.height / 2 - lh / 2, h: lh };
+        }
+        if (len > 0) {
+            const rect = textRect(node, Math.min(offset, len) - 1 < 0 ? 0 : Math.min(offset, len) - 1, Math.min(offset, len) || 1);
+            if (rect) return { x: rect.right, y: rect.top + rect.height / 2 - lh / 2, h: lh };
+        }
+        return node.parentNode ? pointToScreen(node.parentNode, 0) : null;
+    }
+    const child = node.childNodes[offset];
+    if (child) {
+        if (child.nodeType === Node.TEXT_NODE) return pointToScreen(child, 0);
+        const rect = child.getBoundingClientRect();
+        return { x: rect.left, y: rect.top, h: lh };
+    }
+    const prev = node.lastChild;
+    if (prev?.nodeType === Node.TEXT_NODE) return pointToScreen(prev, prev.nodeValue.length);
+    const rect = (prev || node).getBoundingClientRect();
+    return { x: prev ? rect.right : rect.left, y: prev ? rect.top : rect.top, h: lh };
+}
+
+function drawCursors() {
+    const areaRect = area.getBoundingClientRect();
+    const seen = new Set();
+
+    for (const cursor of remoteCursors) {
+        if (cursor.id === myId) continue;
+        seen.add(cursor.id);
+
+        let el = cursorEls.get(cursor.id);
+        if (!el) {
+            el = document.createElement("div");
+            el.className = "remote-cursor";
+            document.body.appendChild(el);
+            cursorEls.set(cursor.id, el);
+        }
+
+        const point = offsetToPoint(cursor.pos);
+        const pos = pointToScreen(point.node, point.offset);
+        const visible = pos
+            && pos.y + pos.h > areaRect.top && pos.y < areaRect.bottom
+            && pos.x >= areaRect.left && pos.x <= areaRect.right;
+        if (!visible) { el.style.display = "none"; continue; }
+
+        el.style.setProperty("--c", cursor.color);
+        el.style.left = `${pos.x}px`;
+        el.style.top = `${pos.y}px`;
+        el.style.height = `${pos.h}px`;
+        el.style.display = "block";
+    }
+
+    for (const [id, el] of cursorEls) {
+        if (!seen.has(id)) { el.remove(); cursorEls.delete(id); }
+    }
+}
+
+function renderCursors() {
+    if (cursorsRaf) return;
+    cursorsRaf = requestAnimationFrame(() => {
+        cursorsRaf = null;
+        drawCursors();
+    });
+}
+
+function sendCursor() {
+    if (socket?.readyState !== WebSocket.OPEN) return;
+    const range = currentAreaRange();
+    const pos = document.activeElement === area && range
+        ? pointToOffset(range.startContainer, range.startOffset)
+        : null;
+    if (pos === lastSentPos) return;
+    lastSentPos = pos;
+    socket.send(JSON.stringify({ type: "cursor", pos }));
+}
+
+function scheduleCursor() {
+    clearTimeout(cursorTimer);
+    cursorTimer = setTimeout(sendCursor, 60);
+}
+
+area.addEventListener("focus", scheduleCursor);
+area.addEventListener("blur", scheduleCursor);
 
 // ---------- WebSocket sync ----------
 
@@ -340,10 +511,20 @@ function connect() {
 
     ws.onopen = () => {
         setStatus("");
+        lastSentPos = undefined; // the server has no caret for this new connection yet
+        scheduleCursor();
         if (dirty) sendHtml(); // push edits made while we were offline
     };
     ws.onmessage = event => {
         const data = JSON.parse(event.data);
+        if (data.type === "hello") {
+            myId = data.id;
+            document.documentElement.style.setProperty("--me", data.color);
+        }
+        if (data.type === "cursors") {
+            remoteCursors = data.cursors || [];
+            renderCursors();
+        }
         if (data.type === "update") {
             pendingRemote = data.text || "";
             flushRemote();
@@ -379,6 +560,8 @@ function goOffline() {
     }
     clearTimeout(reconnectTimer);
     clearTimeout(pendingTimer);
+    remoteCursors = [];
+    drawCursors();
     if (socket) {
         socket.onclose = null;
         socket.close();
@@ -568,8 +751,12 @@ document.addEventListener("click", event => {
 area.addEventListener("scroll", () => {
     gutters.scrollTop = area.scrollTop;
     positionHandles();
+    renderCursors();
 });
-window.addEventListener("resize", positionHandles);
+window.addEventListener("resize", () => {
+    positionHandles();
+    renderCursors();
+});
 
 // ---------- Image upload / paste / drop ----------
 

@@ -162,3 +162,29 @@ button:hover {
     pointer-events: none;
     user-select: none;
 }
+
+.remote-cursor {
+    position: fixed;
+    display: none;
+    width: 2px;
+    background: var(--c);
+    pointer-events: none;
+    z-index: 4;
+    transition: left 0.08s linear, top 0.08s linear;
+}
+
+.remote-cursor::before {
+    content: "";
+    position: absolute;
+    top: -3px;
+    left: -2px;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--c);
+}
+
+#user-count::before {
+    content: "\25CF ";
+    color: var(--me, #000);
+}

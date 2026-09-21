@@ -2,6 +2,8 @@ import json
 import logging
 import os
 import threading
+import uuid
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -46,6 +48,14 @@ state_lock = threading.Lock()
 # two threads at once, but one slow client shouldn't block sends to the others.
 clients = {}
 clients_lock = threading.Lock()
+
+# Per-connection identity + caret position, guarded by clients_lock.
+# Connections only exist while a page is focused, so every entry is a live user.
+CURSOR_COLORS = [
+    "#e6194b", "#3cb44b", "#4363d8", "#f58231", "#911eb4",
+    "#008080", "#f032e6", "#9a6324", "#800000", "#808000",
+]
+client_meta = {}
 
 
 def save_paste(text):
@@ -94,6 +104,22 @@ def broadcast_state(exclude=None):
         with clients_lock:
             for ws in dead:
                 clients.pop(ws, None)
+                client_meta.pop(ws, None)
+
+
+def broadcast_cursors():
+    """Send every user's caret position (and color) to all clients."""
+    with clients_lock:
+        targets = list(clients.items())
+        cursors = [dict(m) for m in client_meta.values() if m["pos"] is not None]
+
+    payload = json.dumps({"type": "cursors", "cursors": cursors})
+    dead = [ws for ws, lock in targets if not safe_send(ws, lock, payload)]
+    if dead:
+        with clients_lock:
+            for ws in dead:
+                clients.pop(ws, None)
+                client_meta.pop(ws, None)
 
 
 load_saved_paste()
@@ -136,9 +162,18 @@ def pastebin_websocket(ws):
     send_lock = threading.Lock()
     with clients_lock:
         clients[ws] = send_lock
+        used = Counter(m["color"] for m in client_meta.values())
+        me = {
+            "id": uuid.uuid4().hex[:8],
+            "color": min(CURSOR_COLORS, key=lambda c: used[c]),
+            "pos": None,
+        }
+        client_meta[ws] = me
 
+    safe_send(ws, send_lock, json.dumps({"type": "hello", "id": me["id"], "color": me["color"]}))
     # Also delivers the current state to the newly connected client.
     broadcast_state()
+    broadcast_cursors()
 
     try:
         while (raw := ws.receive()) is not None:
@@ -146,7 +181,22 @@ def pastebin_websocket(ws):
                 data = json.loads(raw)
             except (TypeError, ValueError):
                 continue
-            if not isinstance(data, dict) or data.get("type") != "update":
+            if not isinstance(data, dict):
+                continue
+            kind = data.get("type")
+            if kind == "cursor":
+                pos = data.get("pos")
+                if pos is not None and (
+                    not isinstance(pos, int) or isinstance(pos, bool) or pos < 0
+                ):
+                    continue
+                with clients_lock:
+                    meta = client_meta.get(ws)
+                    if meta:
+                        meta["pos"] = pos
+                broadcast_cursors()
+                continue
+            if kind != "update":
                 continue
 
             text = str(data.get("text", ""))
@@ -160,7 +210,9 @@ def pastebin_websocket(ws):
     finally:
         with clients_lock:
             clients.pop(ws, None)
+            client_meta.pop(ws, None)
         broadcast_state()
+        broadcast_cursors()
 
 
 if __name__ == "__main__":
