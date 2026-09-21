@@ -558,6 +558,8 @@ area.addEventListener("blur", scheduleCursor);
 // ---------- WebSocket sync ----------
 
 let pendingRemote = null;
+let pendingQuiet = false;
+let expectSnapshot = false;
 let pendingTimer = null;
 let dirty = false;
 let lastEditAt = 0;
@@ -583,10 +585,94 @@ function restoreSelection({ start, end }) {
     selection.addRange(range);
 }
 
-// Replaces the editor content with a remote version while keeping the local
-// caret attached to the same text: edits made before the caret shift it,
-// edits after it leave it alone.
-function applyRemote(text) {
+// Small "someone is typing" indicator, shown whenever a remote edit lands.
+const typingEl = document.createElement("div");
+typingEl.id = "typing-indicator";
+typingEl.textContent = "Someone is typing\u2026";
+document.body.appendChild(typingEl);
+let typingIndicatorTimer = null;
+
+function showTypingIndicator() {
+    typingEl.style.display = "block";
+    clearTimeout(typingIndicatorTimer);
+    typingIndicatorTimer = setTimeout(() => { typingEl.style.display = "none"; }, 1500);
+}
+
+function sameNode(a, b) {
+    if (a.nodeType !== b.nodeType) return false;
+    if (a.nodeType === Node.TEXT_NODE) return a.nodeValue === b.nodeValue;
+    if (a.nodeType !== Node.ELEMENT_NODE) return true;
+    if (a.tagName !== b.tagName) return false;
+    if (a.tagName === "IMG") {
+        return a.getAttribute("src") === b.getAttribute("src")
+            && a.style.width === b.style.width
+            && a.style.height === b.style.height;
+    }
+    if (a.childNodes.length !== b.childNodes.length) return false;
+    return Array.from(a.childNodes).every((child, i) => sameNode(child, b.childNodes[i]));
+}
+
+// Edits text in place. The browser moves any caret/selection inside the node
+// along with the edit, exactly like a normal keystroke would.
+function patchText(node, fresh) {
+    const oldText = node.nodeValue;
+    const newText = fresh.nodeValue;
+    const limit = Math.min(oldText.length, newText.length);
+    let prefix = 0;
+    while (prefix < limit && oldText[prefix] === newText[prefix]) prefix++;
+    let suffix = 0;
+    while (
+        suffix < limit - prefix
+        && oldText[oldText.length - 1 - suffix] === newText[newText.length - 1 - suffix]
+    ) suffix++;
+    node.replaceData(prefix, oldText.length - prefix - suffix, newText.slice(prefix, newText.length - suffix));
+}
+
+// Updates `parent` to match `fresh` touching only what differs, so unchanged
+// nodes (and a caret inside them) are never recreated.
+// Returns true if any node was replaced, added or removed.
+function patchChildren(parent, fresh) {
+    const oldNodes = Array.from(parent.childNodes);
+    const newNodes = Array.from(fresh.childNodes);
+
+    let start = 0;
+    while (start < oldNodes.length && start < newNodes.length && sameNode(oldNodes[start], newNodes[start])) start++;
+    let oldEnd = oldNodes.length;
+    let newEnd = newNodes.length;
+    while (oldEnd > start && newEnd > start && sameNode(oldNodes[oldEnd - 1], newNodes[newEnd - 1])) {
+        oldEnd--;
+        newEnd--;
+    }
+
+    const oldMid = oldNodes.slice(start, oldEnd);
+    const newMid = newNodes.slice(start, newEnd);
+    let structural = false;
+
+    if (oldMid.length === newMid.length) {
+        oldMid.forEach((oldNode, i) => {
+            const newNode = newMid[i];
+            if (oldNode.nodeType === Node.TEXT_NODE && newNode.nodeType === Node.TEXT_NODE) {
+                patchText(oldNode, newNode);
+            } else if (oldNode.tagName === "DIV" && newNode.tagName === "DIV") {
+                if (patchChildren(oldNode, newNode)) structural = true;
+            } else {
+                parent.replaceChild(newNode, oldNode);
+                structural = true;
+            }
+        });
+    } else {
+        const anchor = oldNodes[oldEnd] || null;
+        oldMid.forEach(node => node.remove());
+        newMid.forEach(node => parent.insertBefore(node, anchor));
+        structural = true;
+    }
+    return structural;
+}
+
+// Applies a remote version of the content without disturbing the local caret:
+// text edits are patched in place; only when whole lines/images are added or
+// removed is the caret re-placed by offset.
+function applyRemote(text, quiet = false) {
     const html = sanitizeHtml(text || "");
     if (html === sanitizeHtml(area.innerHTML)) return;
 
@@ -595,16 +681,19 @@ function applyRemote(text) {
     const scroll = area.scrollTop;
 
     deselectImage();
-    area.innerHTML = html;
+    const template = document.createElement("template");
+    template.innerHTML = html;
+    const structural = patchChildren(area, template.content);
 
     const after = serializeContent();
-    if (selection) {
+    if (selection && structural) {
         const shift = diffShift(before, after);
         restoreSelection({ start: shift(selection.start), end: shift(selection.end) });
     }
     lastContent = after;
     area.scrollTop = scroll;
     updateGutters();
+    if (!quiet) showTypingIndicator();
 }
 
 // Only hold back remote changes while the user is actively editing here.
@@ -625,7 +714,7 @@ function flushRemote() {
     }
     const text = pendingRemote;
     pendingRemote = null;
-    applyRemote(text);
+    applyRemote(text, pendingQuiet);
 }
 
 area.addEventListener("blur", flushRemote);
@@ -643,6 +732,7 @@ function connect() {
 
     ws.onopen = () => {
         setStatus("");
+        expectSnapshot = true;
         lastSentPos = undefined; // the server has no caret for this new connection yet
         scheduleCursor();
         if (dirty) sendHtml(); // push edits made while we were offline
@@ -658,6 +748,8 @@ function connect() {
         }
         if (data.type === "update") {
             pendingRemote = data.text || "";
+            pendingQuiet = expectSnapshot; // the first update after connecting is just the initial state
+            expectSnapshot = false;
             flushRemote();
         }
         if (data.type === "saved") setStatus("Saved", 1200);
