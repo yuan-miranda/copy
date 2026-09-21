@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import threading
 import uuid
 from collections import Counter
@@ -56,6 +57,10 @@ CURSOR_COLORS = [
     "#008080", "#f032e6", "#9a6324", "#800000", "#808000",
 ]
 client_meta = {}
+# A browser keeps a cookie id, so it gets the same cursor color every time it
+# reconnects (until the server restarts).
+user_colors = {}
+UID_RE = re.compile(r"^[A-Za-z0-9-]{8,64}$")
 
 
 def save_paste(text):
@@ -87,14 +92,21 @@ def safe_send(ws, lock, payload):
         return False
 
 
-def broadcast_state(exclude=None):
-    """Send the current text and user count to every client except `exclude`."""
+def broadcast_state(exclude=None, sender=None):
+    """Send the current text and user count to every client except `exclude`.
+
+    `sender` is the connection id of whoever made the edit, so clients know
+    whose cursor already reflects it.
+    """
     with clients_lock:
         targets = list(clients.items())
     with state_lock:
         text = paste_text
 
-    payload = json.dumps({"type": "update", "text": text, "users": len(targets)})
+    message = {"type": "update", "text": text, "users": len(targets)}
+    if sender:
+        message["from"] = sender
+    payload = json.dumps(message)
     dead = [
         ws
         for ws, lock in targets
@@ -111,7 +123,11 @@ def broadcast_cursors():
     """Send every user's caret position (and color) to all clients."""
     with clients_lock:
         targets = list(clients.items())
-        cursors = [dict(m) for m in client_meta.values() if m["pos"] is not None]
+        cursors = [
+            {"id": m["id"], "color": m["color"], "pos": m["pos"]}
+            for m in client_meta.values()
+            if m["pos"] is not None
+        ]
 
     payload = json.dumps({"type": "cursors", "cursors": cursors})
     dead = [ws for ws, lock in targets if not safe_send(ws, lock, payload)]
@@ -160,12 +176,18 @@ def pastebin_image_view(filename):
 def pastebin_websocket(ws):
     global paste_text
     send_lock = threading.Lock()
+    uid = request.cookies.get("pastebin_uid", "")
+    if not UID_RE.match(uid):
+        uid = uuid.uuid4().hex
     with clients_lock:
         clients[ws] = send_lock
-        used = Counter(m["color"] for m in client_meta.values())
+        if uid not in user_colors:
+            used = Counter(m["color"] for m in client_meta.values())
+            user_colors[uid] = min(CURSOR_COLORS, key=lambda c: used[c])
         me = {
+            # Unique per connection, so two tabs of one browser never collide.
             "id": uuid.uuid4().hex[:8],
-            "color": min(CURSOR_COLORS, key=lambda c: used[c]),
+            "color": user_colors[uid],
             "pos": None,
         }
         client_meta[ws] = me
@@ -203,7 +225,7 @@ def pastebin_websocket(ws):
             with state_lock:
                 paste_text = text
                 save_paste(text)
-            broadcast_state(exclude=ws)
+            broadcast_state(exclude=ws, sender=me["id"])
             safe_send(ws, send_lock, '{"type": "saved"}')
     except Exception:
         pass

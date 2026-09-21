@@ -17,6 +17,18 @@ let selectedImg = null;
 let resizeState = null;
 let lastRange = null;
 
+// ---------- Identity ----------
+
+// A cookie identifies this browser to the server, so its cursor color stays the
+// same across reconnects. The server reads it during the websocket handshake.
+(function ensureUserCookie() {
+    if (/(?:^|; )pastebin_uid=/.test(document.cookie)) return;
+    const bytes = new Uint8Array(16);
+    (window.crypto || window.msCrypto).getRandomValues(bytes);
+    const id = Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
+    document.cookie = `pastebin_uid=${id}; max-age=31536000; path=/; SameSite=Lax`;
+})();
+
 // ---------- Helpers ----------
 
 function setStatus(text, duration = 0) {
@@ -559,6 +571,7 @@ area.addEventListener("blur", scheduleCursor);
 
 let pendingRemote = null;
 let pendingQuiet = false;
+let pendingFrom = null;
 let expectSnapshot = false;
 let pendingTimer = null;
 let dirty = false;
@@ -672,7 +685,7 @@ function patchChildren(parent, fresh) {
 // Applies a remote version of the content without disturbing the local caret:
 // text edits are patched in place; only when whole lines/images are added or
 // removed is the caret re-placed by offset.
-function applyRemote(text, quiet = false) {
+function applyRemote(text, quiet = false, from = null) {
     const html = sanitizeHtml(text || "");
     if (html === sanitizeHtml(area.innerHTML)) return;
 
@@ -686,10 +699,14 @@ function applyRemote(text, quiet = false) {
     const structural = patchChildren(area, template.content);
 
     const after = serializeContent();
+    const shift = diffShift(before, after);
     if (selection && structural) {
-        const shift = diffShift(before, after);
         restoreSelection({ start: shift(selection.start), end: shift(selection.end) });
     }
+    // Keep everyone else's cursor attached to its text too. The author's own
+    // cursor is skipped: it reports its real position itself.
+    remoteCursors = remoteCursors.map(cursor =>
+        cursor.id === from ? cursor : { ...cursor, pos: shift(cursor.pos) });
     lastContent = after;
     area.scrollTop = scroll;
     updateGutters();
@@ -714,7 +731,7 @@ function flushRemote() {
     }
     const text = pendingRemote;
     pendingRemote = null;
-    applyRemote(text, pendingQuiet);
+    applyRemote(text, pendingQuiet, pendingFrom);
 }
 
 area.addEventListener("blur", flushRemote);
@@ -748,6 +765,7 @@ function connect() {
         }
         if (data.type === "update") {
             pendingRemote = data.text || "";
+            pendingFrom = data.from || null;
             pendingQuiet = expectSnapshot; // the first update after connecting is just the initial state
             expectSnapshot = false;
             flushRemote();
