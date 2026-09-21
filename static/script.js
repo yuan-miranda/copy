@@ -507,9 +507,10 @@ function drawCursors() {
 }
 
 function renderCursors() {
-    // Hold other users' cursors still while typing, then let them settle.
+    // Hide other users' cursors while typing, then bring them back once idle.
     const wait = typingUntil - Date.now();
     if (wait > 0) {
+        cursorEls.forEach(el => { el.style.display = "none"; });
         clearTimeout(freezeTimer);
         freezeTimer = setTimeout(renderCursors, wait + 20);
         return;
@@ -522,15 +523,28 @@ function renderCursors() {
     });
 }
 
-function sendCursor() {
-    if (socket?.readyState !== WebSocket.OPEN) return;
-    const range = currentAreaRange();
-    const pos = document.activeElement === area && range
-        ? pointToOffset(range.startContainer, range.startOffset)
-        : null;
+function postCursor(pos) {
     if (pos === lastSentPos) return;
     lastSentPos = pos;
     socket.send(JSON.stringify({ type: "cursor", pos }));
+}
+
+function sendCursor() {
+    if (socket?.readyState !== WebSocket.OPEN) return;
+
+    // While typing, hide our cursor for everyone; it reappears once we stop.
+    const wait = typingUntil - Date.now();
+    if (wait > 0) {
+        postCursor(null);
+        clearTimeout(cursorTimer);
+        cursorTimer = setTimeout(sendCursor, wait + 50);
+        return;
+    }
+
+    const range = currentAreaRange();
+    postCursor(document.activeElement === area && range
+        ? pointToOffset(range.startContainer, range.startOffset)
+        : null);
 }
 
 function scheduleCursor() {
@@ -726,6 +740,7 @@ area.addEventListener("input", () => {
     lastEditAt = Date.now();
     typingUntil = Date.now() + 600;
     anchorRemoteCursors();
+    sendCursor();
     setStatus("Syncing...");
     clearTimeout(saveTimer);
     saveTimer = setTimeout(sendHtml, 300);
