@@ -270,11 +270,17 @@ let cursorTimer = null;
 let cursorsRaf = null;
 let lastSentPos;
 
+function isBlock(node) {
+    return node.tagName === "DIV" && node !== area;
+}
+
+// Each block (<div>) start counts as 1 so the end of one line and the start of an
+// empty line below it are different offsets.
 function unitsOf(node) {
     if (node.nodeType === Node.TEXT_NODE) return node.nodeValue.length;
     if (node.nodeType !== Node.ELEMENT_NODE) return 0;
     if (node.tagName === "BR" || node.tagName === "IMG") return 1;
-    let total = 0;
+    let total = isBlock(node) ? 1 : 0;
     node.childNodes.forEach(child => { total += unitsOf(child); });
     return total;
 }
@@ -284,20 +290,24 @@ function pointToOffset(target, targetOffset) {
     let found = false;
     function walk(node) {
         if (found) return;
+        if (node.nodeType === Node.TEXT_NODE) {
+            if (node === target) { count += targetOffset; found = true; }
+            else count += node.nodeValue.length;
+            return;
+        }
+        if (node.nodeType !== Node.ELEMENT_NODE) return;
+        if (node.tagName === "BR" || node.tagName === "IMG") {
+            count += 1;
+            return;
+        }
+        if (isBlock(node)) count += 1;
         if (node === target) {
-            if (node.nodeType === Node.TEXT_NODE) {
-                count += targetOffset;
-            } else {
-                for (let i = 0; i < targetOffset && i < node.childNodes.length; i++) {
-                    count += unitsOf(node.childNodes[i]);
-                }
+            for (let i = 0; i < targetOffset && i < node.childNodes.length; i++) {
+                count += unitsOf(node.childNodes[i]);
             }
             found = true;
             return;
         }
-        if (node.nodeType === Node.TEXT_NODE) { count += node.nodeValue.length; return; }
-        if (node.nodeType !== Node.ELEMENT_NODE) return;
-        if (node.tagName === "BR" || node.tagName === "IMG") { count += 1; return; }
         node.childNodes.forEach(walk);
     }
     walk(area);
@@ -307,6 +317,7 @@ function pointToOffset(target, targetOffset) {
 function offsetToPoint(offset) {
     let remaining = offset;
     let result = null;
+    const indexOf = node => Array.prototype.indexOf.call(node.parentNode.childNodes, node);
     function walk(node) {
         if (result) return;
         if (node.nodeType === Node.TEXT_NODE) {
@@ -316,12 +327,20 @@ function offsetToPoint(offset) {
         }
         if (node.nodeType !== Node.ELEMENT_NODE) return;
         if (node.tagName === "BR" || node.tagName === "IMG") {
-            if (remaining === 0) {
-                result = { node: node.parentNode, offset: Array.prototype.indexOf.call(node.parentNode.childNodes, node) };
-            } else {
-                remaining -= 1;
-            }
+            if (remaining === 0) result = { node: node.parentNode, offset: indexOf(node) };
+            else remaining -= 1;
             return;
+        }
+        if (isBlock(node)) {
+            if (remaining === 0) {
+                result = { node: node.parentNode, offset: indexOf(node) };
+                return;
+            }
+            remaining -= 1;
+            if (remaining === 0 && !node.childNodes.length) {
+                result = { node, offset: 0 };
+                return;
+            }
         }
         node.childNodes.forEach(walk);
     }
@@ -338,31 +357,73 @@ function textRect(node, start, end) {
     return rect.height > 0 ? rect : null;
 }
 
+// Rect of the caret itself at a DOM point (works on most text positions).
+function caretRect(node, offset) {
+    try {
+        const range = document.createRange();
+        range.setStart(node, offset);
+        range.collapse(true);
+        const rects = range.getClientRects();
+        const rect = rects.length ? rects[0] : range.getBoundingClientRect();
+        return rect.height > 0 ? rect : null;
+    } catch {
+        return null;
+    }
+}
+
+// Empty lines (<div><br></div>, lone <br>) often report a zero-size rect, so
+// climb to the nearest ancestor that has real geometry.
+function elementPos(el, atEnd) {
+    const lh = getLineHeight();
+    for (let cur = el; cur && cur !== area; cur = cur.parentElement) {
+        const rect = cur.getBoundingClientRect();
+        if (rect.width > 0 || rect.height > 0) {
+            return { x: atEnd ? rect.right : rect.left, y: rect.top, h: lh };
+        }
+    }
+    const areaRect = area.getBoundingClientRect();
+    const style = getComputedStyle(area);
+    return {
+        x: areaRect.left + (parseFloat(style.paddingLeft) || 0),
+        y: areaRect.top + (parseFloat(style.paddingTop) || 0) - area.scrollTop,
+        h: lh,
+    };
+}
+
 // Screen position { x, y, h } of a DOM point, or null if it can't be measured.
 function pointToScreen(node, offset) {
     const lh = getLineHeight();
+    const fromRect = (x, rect) => ({ x, y: rect.top + rect.height / 2 - lh / 2, h: lh });
+
     if (node.nodeType === Node.TEXT_NODE) {
         const len = node.nodeValue.length;
+        const caret = caretRect(node, offset);
+        if (caret) return fromRect(caret.left, caret);
         if (offset < len) {
             const rect = textRect(node, offset, offset + 1);
-            if (rect) return { x: rect.left, y: rect.top + rect.height / 2 - lh / 2, h: lh };
+            if (rect) return fromRect(rect.left, rect);
         }
         if (len > 0) {
-            const rect = textRect(node, Math.min(offset, len) - 1 < 0 ? 0 : Math.min(offset, len) - 1, Math.min(offset, len) || 1);
-            if (rect) return { x: rect.right, y: rect.top + rect.height / 2 - lh / 2, h: lh };
+            const at = Math.min(offset, len);
+            const rect = textRect(node, at - 1, at);
+            if (rect) return fromRect(rect.right, rect);
         }
-        return node.parentNode ? pointToScreen(node.parentNode, 0) : null;
+        return elementPos(node.parentElement || area, false);
     }
+
     const child = node.childNodes[offset];
     if (child) {
         if (child.nodeType === Node.TEXT_NODE) return pointToScreen(child, 0);
-        const rect = child.getBoundingClientRect();
-        return { x: rect.left, y: rect.top, h: lh };
+        if (child.tagName !== "IMG") {
+            const caret = caretRect(node, offset);
+            if (caret) return fromRect(caret.left, caret);
+        }
+        return elementPos(child, false);
     }
     const prev = node.lastChild;
     if (prev?.nodeType === Node.TEXT_NODE) return pointToScreen(prev, prev.nodeValue.length);
-    const rect = (prev || node).getBoundingClientRect();
-    return { x: prev ? rect.right : rect.left, y: prev ? rect.top : rect.top, h: lh };
+    if (prev) return elementPos(prev, true);
+    return elementPos(node, false);
 }
 
 function drawCursors() {
@@ -519,7 +580,6 @@ function connect() {
         const data = JSON.parse(event.data);
         if (data.type === "hello") {
             myId = data.id;
-            document.documentElement.style.setProperty("--me", data.color);
         }
         if (data.type === "cursors") {
             remoteCursors = data.cursors || [];
