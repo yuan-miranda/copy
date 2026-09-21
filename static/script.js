@@ -368,6 +368,20 @@ function deselectImage() {
     handles.forEach(h => { h.style.display = "none"; });
 }
 
+// Live size readout shown in the center of the image while resizing.
+const sizeBadge = document.createElement("div");
+sizeBadge.id = "size-badge";
+document.body.appendChild(sizeBadge);
+
+function updateSizeBadge() {
+    if (!selectedImg) return;
+    const rect = selectedImg.getBoundingClientRect();
+    sizeBadge.textContent = `${Math.round(rect.width)} × ${Math.round(rect.height)}`;
+    sizeBadge.style.left = `${rect.left + rect.width / 2}px`;
+    sizeBadge.style.top = `${rect.top + rect.height / 2}px`;
+    sizeBadge.style.display = "block";
+}
+
 function startResize(event, mode, handle) {
     if (!selectedImg) return;
     event.preventDefault();
@@ -383,6 +397,7 @@ function startResize(event, mode, handle) {
         aspectRatio: selectedImg.naturalWidth / selectedImg.naturalHeight || 1,
         charWidth: getCharWidth(),
     };
+    updateSizeBadge();
     handle.setPointerCapture(event.pointerId);
     handle.addEventListener("pointermove", onResizeMove);
     handle.addEventListener("pointerup", endResize);
@@ -413,6 +428,7 @@ function onResizeMove(event) {
     selectedImg.style.objectFit = "contain";
 
     positionHandles();
+    updateSizeBadge();
     updateGutters();
 }
 
@@ -422,6 +438,7 @@ function endResize(event) {
     handle.removeEventListener("pointermove", onResizeMove);
     handle.removeEventListener("pointerup", endResize);
     resizeState = null;
+    sizeBadge.style.display = "none";
     notifyChange();
 }
 
