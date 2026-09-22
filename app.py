@@ -181,13 +181,19 @@ def pastebin_websocket(ws):
         uid = uuid.uuid4().hex
     with clients_lock:
         clients[ws] = send_lock
-        if uid not in user_colors:
-            used = Counter(m["color"] for m in client_meta.values())
-            user_colors[uid] = min(CURSOR_COLORS, key=lambda c: used[c])
+        # Recompute against who's *currently* connected every time. A remembered
+        # color is only safe to reuse if nobody else online is holding it right
+        # now; otherwise two different people can end up sharing one color and
+        # their cursors become visually indistinguishable from each other.
+        used = Counter(m["color"] for m in client_meta.values())
+        remembered = user_colors.get(uid)
+        color = remembered if remembered is not None and used[remembered] == 0 \
+            else min(CURSOR_COLORS, key=lambda c: used[c])
+        user_colors[uid] = color
         me = {
             # Unique per connection, so two tabs of one browser never collide.
             "id": uuid.uuid4().hex[:8],
-            "color": user_colors[uid],
+            "color": color,
             "pos": None,
         }
         client_meta[ws] = me
