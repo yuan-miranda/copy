@@ -641,13 +641,10 @@ function patchText(node, fresh) {
     node.replaceData(prefix, oldText.length - prefix - suffix, newText.slice(prefix, newText.length - suffix));
 }
 
-// Updates `parent` to match `fresh` touching only what differs, so unchanged
-// nodes (and a caret inside them) are never recreated.
-// Returns true if any node was replaced, added or removed.
-function patchChildren(parent, fresh) {
-    const oldNodes = Array.from(parent.childNodes);
-    const newNodes = Array.from(fresh.childNodes);
-
+// How far the matching (unchanged) run at the start and end of two node lists
+// reaches. Nodes outside [start, oldEnd) are identical between old and new;
+// only the nodes in between actually differ.
+function commonBoundaries(oldNodes, newNodes) {
     let start = 0;
     while (start < oldNodes.length && start < newNodes.length && sameNode(oldNodes[start], newNodes[start])) start++;
     let oldEnd = oldNodes.length;
@@ -656,6 +653,16 @@ function patchChildren(parent, fresh) {
         oldEnd--;
         newEnd--;
     }
+    return { start, oldEnd, newEnd };
+}
+
+// Updates `parent` to match `fresh` touching only what differs, so unchanged
+// nodes (and a caret inside them) are never recreated.
+// Returns true if any node was replaced, added or removed.
+function patchChildren(parent, fresh) {
+    const oldNodes = Array.from(parent.childNodes);
+    const newNodes = Array.from(fresh.childNodes);
+    const { start, oldEnd, newEnd } = commonBoundaries(oldNodes, newNodes);
 
     const oldMid = oldNodes.slice(start, oldEnd);
     const newMid = newNodes.slice(start, newEnd);
@@ -682,20 +689,61 @@ function patchChildren(parent, fresh) {
     return structural;
 }
 
+// The top-level child of `area` (a line's <div>, or a bare text/br/img node
+// for the first line before any Enter is pressed) that contains `node`.
+function lineAncestor(node) {
+    while (node && node.parentNode && node.parentNode !== area) node = node.parentNode;
+    return node && node.parentNode === area ? node : null;
+}
+
+function currentLineNode() {
+    const range = currentAreaRange();
+    if (!range) return null;
+    const { startContainer, startOffset } = range;
+    if (startContainer === area) return lineAncestor(area.childNodes[startOffset] || area.lastChild);
+    return lineAncestor(startContainer);
+}
+
+// The one line an incoming update must not touch right now: whichever line
+// has the caret while we're actively typing, or the line holding the image
+// currently being resized. Null means nothing needs protecting.
+function protectedLineNode() {
+    if (resizeState) return selectedImg ? lineAncestor(selectedImg) : null;
+    if (document.activeElement === area && isActivelyEditing()) return currentLineNode();
+    return null;
+}
+
 // Applies a remote version of the content without disturbing the local caret:
 // text edits are patched in place; only when whole lines/images are added or
 // removed is the caret re-placed by offset.
+// Returns true once applied. Returns false without touching the DOM if the
+// update overlaps the line we're actively editing/resizing right now -- the
+// caller is expected to hold onto `text` and retry later in that case.
 function applyRemote(text, quiet = false, from = null) {
     const html = sanitizeHtml(text || "");
-    if (html === sanitizeHtml(area.innerHTML)) return;
+    if (html === sanitizeHtml(area.innerHTML)) return true;
+
+    const template = document.createElement("template");
+    template.innerHTML = html;
+
+    const editingLine = protectedLineNode();
+    if (editingLine) {
+        const oldNodes = Array.from(area.childNodes);
+        const newNodes = Array.from(template.content.childNodes);
+        const { start, oldEnd } = commonBoundaries(oldNodes, newNodes);
+        const idx = oldNodes.indexOf(editingLine);
+        // Nodes before `start` or from `oldEnd` on are provably untouched by
+        // this update; anything else means the update reshuffled or edited
+        // the region our line lives in, so it isn't safe to apply yet.
+        const untouched = idx !== -1 && (idx < start || idx >= oldEnd);
+        if (!untouched) return false;
+    }
 
     const selection = document.activeElement === area ? saveSelection() : null;
     const before = serializeContent();
     const scroll = area.scrollTop;
 
-    deselectImage();
-    const template = document.createElement("template");
-    template.innerHTML = html;
+    if (!resizeState) deselectImage();
     const structural = patchChildren(area, template.content);
 
     const after = serializeContent();
@@ -711,27 +759,28 @@ function applyRemote(text, quiet = false, from = null) {
     area.scrollTop = scroll;
     updateGutters();
     if (!quiet) showTypingIndicator();
+    return true;
 }
 
-// Only hold back remote changes while the user is actively editing here.
-// Anything held back is applied once they go idle or leave the editor,
-// instead of being dropped (which used to require a page reload).
+// Whether we currently have a line that needs protecting from incoming
+// updates: the caret's line while typing, or the image's line while resizing.
 function isActivelyEditing() {
     if (resizeState) return true;
     if (document.activeElement !== area || !document.hasFocus()) return false;
     return dirty || Date.now() - lastEditAt < 1500;
 }
 
+// Applies the queued update straight away unless it overlaps the line we're
+// on, in which case it's retried until it no longer overlaps (or we go idle).
 function flushRemote() {
     clearTimeout(pendingTimer);
     if (pendingRemote === null) return;
-    if (isActivelyEditing()) {
+    const applied = applyRemote(pendingRemote, pendingQuiet, pendingFrom);
+    if (!applied) {
         pendingTimer = setTimeout(flushRemote, 700);
         return;
     }
-    const text = pendingRemote;
     pendingRemote = null;
-    applyRemote(text, pendingQuiet, pendingFrom);
 }
 
 area.addEventListener("blur", flushRemote);
